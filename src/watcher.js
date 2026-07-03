@@ -267,43 +267,11 @@ class ChainWatcher {
     }
     if (!exposure) return;
 
+    // Store active nominators for /status and /nominators display
     const currentNoms = {};
     for (const { who, value } of exposure.others) {
       currentNoms[who.toString()] = value.toString();
     }
-
-    const prevNoms        = await this.state.get('nominators_active', {}) || {};
-    const activeBootstrap = await this.state.get('active_bootstrapped', false);
-
-    // On first run save baseline without firing alerts
-    if (!activeBootstrap) {
-      await this.state.set('nominators_active', currentNoms);
-      await this.state.set('nominators', currentNoms);
-      await this.state.set('active_bootstrapped', true);
-      console.log(`[Nominators/Active] Bootstrap: saved ${Object.keys(currentNoms).length} active nominators`);
-      return;
-    }
-
-    const allAddrs = new Set([...Object.keys(currentNoms), ...Object.keys(prevNoms)]);
-    for (const nomAddr of allAddrs) {
-      const curr = currentNoms[nomAddr];
-      const prev = prevNoms[nomAddr];
-
-      if (curr && !prev) {
-        await this.notifier.nominatorAdded(this.addr, nomAddr, toToken(curr, this.decimals), this.token, true);
-      } else if (!curr && prev) {
-        await this.notifier.nominatorRemoved(this.addr, nomAddr, toToken(prev, this.decimals), this.token, true);
-      } else if (curr && prev && curr !== prev) {
-        const oldAmt = toFloat(prev, this.decimals);
-        const newAmt = toFloat(curr, this.decimals);
-        if (Math.abs(newAmt - oldAmt) > 1) {
-          await this.notifier.nominatorAmountChanged(
-            this.addr, nomAddr, oldAmt.toFixed(4), newAmt.toFixed(4), this.token
-          );
-        }
-      }
-    }
-
     await this.state.set('nominators_active', currentNoms);
     await this.state.set('nominators', currentNoms);
   }
@@ -352,41 +320,64 @@ class ChainWatcher {
 
     await this.state.set('nominators_pending', currentPending);
 
-    // On first run save baseline without firing alerts
-    const bootstrapped = await this.state.get('pending_bootstrapped', false);
+    // ── Unified pool diff: active + pending combined ────────────────────────────
+    // We track the full nominator set regardless of active/waiting status.
+    // What matters: did someone start or stop nominating, and how did total change.
+    const allCurrent = { ...currentNoms, ...currentPending };   // waiting overrides if duplicate (shouldn't happen)
+    const prevPool   = await this.state.get('nominators_pool', {}) || {};
+    const bootstrapped = await this.state.get('pool_bootstrapped', false);
+
     if (!bootstrapped) {
-      await this.state.set('pending_bootstrapped', true);
-      console.log(`[Nominators/Pending] Bootstrap: saved ${pendingAddrs.length} waiting nominators`);
+      await this.state.set('nominators_pool', allCurrent);
+      await this.state.set('pool_bootstrapped', true);
+      console.log(`[Nominators] Bootstrap: ${Object.keys(allCurrent).length} total nominators saved as baseline`);
       return;
     }
 
-    const prevPending = await this.state.get('nominators_pending_prev', {}) || {};
-    const allAddrs    = new Set([...Object.keys(currentPending), ...Object.keys(prevPending)]);
+    const allAddrs  = new Set([...Object.keys(allCurrent), ...Object.keys(prevPool)]);
+    const prevTotal = Object.values(prevPool).reduce((s, v) => s + toFloat(v, this.decimals), 0);
 
-    let added = 0, removed = 0;
+    let changed = false;
     for (const nomAddr of allAddrs) {
-      const curr = currentPending[nomAddr];
-      const prev = prevPending[nomAddr];
+      const curr = allCurrent[nomAddr];
+      const prev = prevPool[nomAddr];
 
       if (curr && !prev) {
-        added++;
-        await this.notifier.nominatorAdded(this.addr, nomAddr, toToken(curr, this.decimals), this.token, false);
+        // New nominator joined
+        changed = true;
+        const newTotal = Object.values(allCurrent).reduce((s, v) => s + toFloat(v, this.decimals), 0);
+        const delta    = newTotal - prevTotal;
+        await this.notifier.nominatorJoined(
+          nomAddr, toFloat(curr, this.decimals).toFixed(4),
+          newTotal.toFixed(4), delta.toFixed(4), this.token
+        );
       } else if (!curr && prev) {
-        removed++;
-        await this.notifier.nominatorRemoved(this.addr, nomAddr, toToken(prev, this.decimals), this.token, false);
-      } else if (curr && prev && curr !== prev) {
-        const oldAmt = parseFloat(toToken(prev, this.decimals));
-        const newAmt = parseFloat(toToken(curr, this.decimals));
+        // Nominator left
+        changed = true;
+        const newTotal = Object.values(allCurrent).reduce((s, v) => s + toFloat(v, this.decimals), 0);
+        const delta    = newTotal - prevTotal;
+        await this.notifier.nominatorLeft(
+          nomAddr, toFloat(prev, this.decimals).toFixed(4),
+          newTotal.toFixed(4), delta.toFixed(4), this.token
+        );
+      } else if (curr && prev) {
+        const oldAmt = toFloat(prev, this.decimals);
+        const newAmt = toFloat(curr, this.decimals);
         if (Math.abs(newAmt - oldAmt) > 1) {
-          await this.notifier.nominatorAmountChanged(
-            this.addr, nomAddr, oldAmt.toFixed(4), newAmt.toFixed(4), this.token
+          // Nominator changed their stake
+          changed = true;
+          const newTotal = Object.values(allCurrent).reduce((s, v) => s + toFloat(v, this.decimals), 0);
+          const delta    = newTotal - prevTotal;
+          await this.notifier.nominatorStakeChanged(
+            nomAddr, oldAmt.toFixed(4), newAmt.toFixed(4),
+            newTotal.toFixed(4), delta.toFixed(4), this.token
           );
         }
       }
     }
 
-    await this.state.set('nominators_pending_prev', currentPending);
-    console.log(`[Nominators/Pending] Done: +${added} -${removed}, total waiting: ${pendingAddrs.length}`);
+    if (changed) await this.state.set('nominators_pool', allCurrent);
+    console.log(`[Nominators/Pending] Done, total nominators: ${Object.keys(allCurrent).length}`);
   }
 
   // ── Oversubscribed check ──────────────────────────────────────────────────────
@@ -580,10 +571,9 @@ class ChainWatcher {
     if (!this.api) throw new Error('API not connected');
     const Notifier = require('./notifier');
 
-    const [era, header, validatorPrefs] = await Promise.all([
+    const [era, header] = await Promise.all([
       this._currentEra(),
       this.api.rpc.chain.getHeader(),
-      this.api.query.staking.validators(this.addr).catch(() => null),
     ]);
     const blockNumber = header.number.toNumber();
 
@@ -603,16 +593,15 @@ class ChainWatcher {
       if (ledger.isSome) ownStake = toToken(ledger.unwrap().active.toString(), this.decimals);
     } catch (_) {}
 
-    // Active nominators — fast, from erasStakers only
-    // Waiting nominators — served from state cache (updated by background cycle or /nominators command)
-    let activeNoms = [];
-    let totalStake = ownStake;
+    // Active nominators from erasStakers — only the portion actually staking this era
+    let activeNoms      = [];
+    let eraTotal        = ownStake;  // total from erasStakers (active era only)
 
     if (exposure && !exposure.total.isZero()) {
       activeNoms = exposure.others.map(n => ({
         addr: n.who.toString(), amount: toToken(n.value.toString(), this.decimals),
       }));
-      totalStake = toToken(exposure.total.toString(), this.decimals);
+      eraTotal = toToken(exposure.total.toString(), this.decimals);
     }
 
     const topNominators  = [...activeNoms]
@@ -620,18 +609,27 @@ class ChainWatcher {
       .slice(0, 5);
     const nominatorCount = activeNoms.length;
 
-    // Pending nominators from state cache.
-    // Values may be raw planck strings (from background cycle) or token strings with a decimal
-    // point (saved by the /nominators command) — handle both formats.
-    const pendingMap   = await this.state.get('nominators_pending', {}) || {};
+    // Full pool total — active + waiting nominators combined.
+    // poolMap is set by the background scan; activeMap + pendingMap always exist.
+    // We prefer poolMap when available (most complete), fall back to merging the two caches.
+    const poolMap    = await this.state.get('nominators_pool', {}) || {};
+    const activeMap  = await this.state.get('nominators_active', {}) || {};
+    const pendingMap = await this.state.get('nominators_pending', {}) || {};
+
+    // Use pool if it has data, otherwise merge active + pending (pending keys override active)
+    const mergedMap   = Object.keys(poolMap).length > 0
+      ? poolMap
+      : { ...activeMap, ...pendingMap };
+
     const pendingCount = Object.keys(pendingMap).length;
-    const pendingTotal = Object.values(pendingMap)
-      .reduce((sum, v) => {
-        const str = String(v);
-        const num = str.includes('.') ? parseFloat(str) : parseFloat(toToken(str, this.decimals));
-        return sum + (isNaN(num) ? 0 : num);
-      }, 0)
-      .toFixed(4);
+    const allNomCount  = Object.keys(mergedMap).length;
+
+    // Sum ALL bonded stakes regardless of active/waiting status
+    const poolTotal = allNomCount > 0
+      ? Object.values(mergedMap)
+          .reduce((sum, v) => sum + toFloat(v, this.decimals), 0)
+          .toFixed(4)
+      : null;  // null = no data yet, show placeholder in status
 
     // Session keys (from Relay Chain)
     let sessionKeys     = null;
@@ -653,11 +651,7 @@ class ChainWatcher {
       }
     } catch (e) { console.error('[Status] Session keys error:', e.message); }
 
-    // Commission (Perbill → percentage)
-    let commission = '?';
-    if (validatorPrefs) {
-      commission = (validatorPrefs.commission.toNumber() / 10_000_000).toFixed(1) + '%';
-    }
+
 
     // Payout history from state
     const payoutHistory = await this.state.get('payout_history', []) || [];
@@ -675,10 +669,10 @@ class ChainWatcher {
       network: this.network, address: this.addr,
       online:  this._wasOnline !== false, active: isActive,
       era, blockNumber, token: this.token,
-      ownStake, totalStake,
-      nominatorCount, pendingCount, pendingTotal,
+      ownStake, eraTotal, poolTotal,
+      nominatorCount, allNomCount, pendingCount,
       topNominators, sessionKeys, sessionKeysNote,
-      commission, lastPayoutEra, payoutHistory,
+      lastPayoutEra, payoutHistory,
       uptimeLabel, isOversubscribed: isOver,
       oversubLimit: this.oversubLimit,
     });
