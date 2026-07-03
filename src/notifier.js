@@ -202,30 +202,34 @@ class Notifier {
       `${EMOJI.ok} Nominator count back to normal: <b>${count}/${limit}</b>\n<code>${addr}</code>`);
   }
 
-  nominatorAdded(validatorAddr, nominatorAddr, amount, token, isActive = true) {
-    const tag    = isActive ? `${EMOJI.active} active` : `${EMOJI.inactive} waiting`;
-    const amtStr = amount && amount !== '?' ? `\nStake: <b>${amount} ${token}</b>` : '';
-    return this.notify(`nom_add_${nominatorAddr}`,
-      `${EMOJI.nominator} <b>New nominator</b> (${tag})\n` +
-      `Nominator: <code>${nominatorAddr}</code>${amtStr}`);
+  nominatorJoined(addr, stake, newTotal, delta, token) {
+    const sign = parseFloat(delta) >= 0 ? '+' : '';
+    return this.notify(`nom_join_${addr}`,
+      `${EMOJI.nominator} <b>New nominator</b>\n` +
+      `<code>${addr}</code>\n` +
+      `Stake: <b>${stake} ${token}</b>\n` +
+      `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
   }
 
-  nominatorRemoved(validatorAddr, nominatorAddr, amount, token, isActive = true) {
-    const tag    = isActive ? `${EMOJI.active} active` : `${EMOJI.inactive} waiting`;
-    const amtStr = amount && amount !== '?' ? `\nWas staked: <b>${amount} ${token}</b>` : '';
-    return this.notify(`nom_rm_${nominatorAddr}`,
-      `${EMOJI.nominator} <b>Nominator left</b> (${tag})\n` +
-      `Nominator: <code>${nominatorAddr}</code>${amtStr}`);
+  nominatorLeft(addr, stake, newTotal, delta, token) {
+    const sign = parseFloat(delta) >= 0 ? '+' : '';
+    return this.notify(`nom_left_${addr}`,
+      `${EMOJI.nominator} <b>Nominator left</b>\n` +
+      `<code>${addr}</code>\n` +
+      `Removed stake: <b>${stake} ${token}</b>\n` +
+      `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
   }
 
-  nominatorAmountChanged(validatorAddr, nominatorAddr, oldAmount, newAmount, token) {
-    const delta = parseFloat(newAmount) - parseFloat(oldAmount);
-    const sign  = delta > 0 ? '+' : '';
-    const emoji = delta > 0 ? '📈' : '📉';
-    return this.notify(`nom_chg_${nominatorAddr}`,
+  nominatorStakeChanged(addr, oldStake, newStake, newTotal, delta, token) {
+    const nomDelta = (parseFloat(newStake) - parseFloat(oldStake)).toFixed(4);
+    const nomSign  = parseFloat(nomDelta) >= 0 ? '+' : '';
+    const totSign  = parseFloat(delta) >= 0 ? '+' : '';
+    const emoji    = parseFloat(nomDelta) >= 0 ? '📈' : '📉';
+    return this.notify(`nom_chg_${addr}`,
       `${emoji} <b>Nominator stake changed</b>\n` +
-      `Nominator: <code>${nominatorAddr}</code>\n` +
-      `${oldAmount} → <b>${newAmount} ${token}</b> (${sign}${delta.toFixed(4)})`);
+      `<code>${addr}</code>\n` +
+      `${oldStake} → <b>${newStake} ${token}</b>  (${nomSign}${nomDelta})\n` +
+      `Total: <b>${newTotal} ${token}</b>  (${totSign}${delta} ${token})`);
   }
 
   payoutReceived(validatorAddr, era, amount, token) {
@@ -287,10 +291,7 @@ class Notifier {
       payoutLines = `\nLast payout: era <b>${s.lastPayoutEra}</b>`;
     }
 
-    // Pending nominators line
-    const pendingLine = s.pendingCount != null
-      ? `\n  ${EMOJI.inactive} Waiting:  <b>${s.pendingCount}</b>${s.pendingTotal ? ` — <b>${s.pendingTotal} ${s.token}</b>` : ''}  <i>/nominators</i>`
-      : '';
+
 
     return (
       `${EMOJI.chart} <b>Validator Status</b>\n` +
@@ -300,15 +301,16 @@ class Notifier {
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `Node:        ${onlineStr}\n` +
       `Status:      ${activeStr}\n` +
-      `Commission:  <b>${s.commission}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `${EMOJI.money} Stake:\n` +
-      `  Own:       <b>${s.ownStake} ${s.token}</b>\n` +
-      `  Total:     <b>${s.totalStake} ${s.token}</b>\n` +
+      `  Own:         <b>${s.ownStake} ${s.token}</b>\n` +
+      `  Era active:  <b>${s.eraTotal} ${s.token}</b>\n` +
+      `  All bonded:  <b>${s.poolTotal ? s.poolTotal + ' ' + s.token : '— run /nominators to load'}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `${EMOJI.nominator} Nominators:${overStr}\n` +
-      `  ${EMOJI.active} Active:   <b>${s.nominatorCount}</b> — <b>${s.totalStake} ${s.token}</b>` +
-      pendingLine +
+      `  ${EMOJI.active} Active:   <b>${s.nominatorCount}</b>\n` +
+      `  ${EMOJI.inactive} Waiting:  <b>${s.pendingCount != null ? s.pendingCount : '—'}</b>  <i>/nominators</i>\n` +
+      `  Total:    <b>${s.allNomCount}</b>` +
       nominatorLines + '\n' +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `${EMOJI.key} Session Keys:\n  <code>${keysStr}</code>\n` +
