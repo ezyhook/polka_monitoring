@@ -323,7 +323,8 @@ class ChainWatcher {
     // ── Unified pool diff: active + pending combined ────────────────────────────
     // We track the full nominator set regardless of active/waiting status.
     // What matters: did someone start or stop nominating, and how did total change.
-    const allCurrent = { ...currentNoms, ...currentPending };   // waiting overrides if duplicate (shouldn't happen)
+    const currentNoms = await this.state.get('nominators_active', {}) || {};
+    const allCurrent = { ...currentNoms, ...currentPending };
     const prevPool   = await this.state.get('nominators_pool', {}) || {};
     const bootstrapped = await this.state.get('pool_bootstrapped', false);
 
