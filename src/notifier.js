@@ -38,6 +38,7 @@ class Notifier {
 
     this._statusProvider     = null;
     this._nominatorsProvider = null;
+    this._updateProvider     = null;
     this._historyProvider    = null;
 
     this._registerCommands();
@@ -45,6 +46,7 @@ class Notifier {
 
   setStatusProvider(fn)     { this._statusProvider     = fn; }
   setNominatorsProvider(fn) { this._nominatorsProvider = fn; }
+  setUpdateProvider(fn)     { this._updateProvider     = fn; }
   setHistoryProvider(fn)    { this._historyProvider    = fn; }
 
   stopPolling() { return this.bot.stopPolling(); }
@@ -91,6 +93,19 @@ class Notifier {
       }
     });
 
+    this.bot.onText(/\/update/, async (msg) => {
+      if (!guard(msg)) return;
+      console.log('[Bot] Command: /update');
+      if (!this._updateProvider) return this._reply(msg.chat.id, `${EMOJI.warn} Not available.`);
+      try {
+        await this._reply(msg.chat.id, `${EMOJI.clock} Scanning nominators and updating database…`);
+        await this._reply(msg.chat.id, await this._updateProvider());
+      } catch (e) {
+        console.error('[Bot] /update error:', e);
+        await this._reply(msg.chat.id, `${EMOJI.error} Error: <code>${String(e.message || e)}</code>`);
+      }
+    });
+
     this.bot.onText(/\/history/, async (msg) => {
       if (!guard(msg)) return;
       console.log('[Bot] Command: /history');
@@ -111,11 +126,22 @@ class Notifier {
         `/status — current validator status\n` +
         `/nominators — full nominator list (active &amp; waiting)\n` +
         `/history — last 10 payouts\n` +
+        `/update — refresh nominator database (no display)\n` +
         `/help — this help message`
       );
     });
 
     this.bot.on('polling_error', (e) => console.error('[Bot] Polling error:', e.message));
+
+    // Register commands in Telegram menu (hamburger button)
+    this.bot.setMyCommands([
+      { command: 'status',     description: 'Current validator status' },
+      { command: 'nominators', description: 'Full nominator list (active & waiting)' },
+      { command: 'update',     description: 'Refresh nominator database' },
+      { command: 'history',    description: 'Last 10 reward payouts' },
+      { command: 'help',       description: 'List of commands' },
+    ]).catch(e => console.error('[Bot] setMyCommands error:', e.message));
+
     console.log('[Bot] Commands registered, polling started');
   }
 
@@ -310,7 +336,7 @@ class Notifier {
       `${EMOJI.nominator} Nominators:${overStr}\n` +
       `  ${EMOJI.active} Active:   <b>${s.nominatorCount}</b>\n` +
       `  ${EMOJI.inactive} Waiting:  <b>${s.pendingCount != null ? s.pendingCount : '—'}</b>  <i>/nominators</i>\n` +
-      `  Total:    <b>${s.allNomCount}</b>` +
+      `  Total:    <b>${s.allNomCount + 1}</b> (incl. self)` +
       nominatorLines + '\n' +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `${EMOJI.key} Session Keys:\n  <code>${keysStr}</code>\n` +
