@@ -4,7 +4,7 @@ require('dotenv').config();
 
 const StateManager     = require('./src/state');
 const Notifier         = require('./src/notifier');
-const { ChainWatcher, toToken } = require('./src/watcher');
+const { ChainWatcher, toToken, toFloat } = require('./src/watcher');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -28,9 +28,95 @@ const CONFIG = {
   keyCheckMs:           parseInt(process.env.KEY_CHECK_INTERVAL       || '300000',   10),
   pendingCheckInterval: parseInt(process.env.PENDING_CHECK_INTERVAL   || '14400000', 10),
   oversubLimit:         parseInt(process.env.OVERSUB_LIMIT            || '512',      10),
-  offlineThreshold:     parseInt(process.env.OFFLINE_THRESHOLD          || '3',        10),
-  onlineThreshold:      parseInt(process.env.ONLINE_THRESHOLD           || '2',        10),
+  offlineThreshold:     parseInt(process.env.OFFLINE_THRESHOLD        || '3',        10),
+  onlineThreshold:      parseInt(process.env.ONLINE_THRESHOLD         || '2',        10),
+  minStakeChange:       parseFloat(process.env.MIN_STAKE_CHANGE       || '100'),
 };
+
+// ── Shared nominator scan (used by /nominators and /update) ───────────────────
+
+async function scanNominators(watcher, state) {
+  const era      = await watcher._currentEra();
+  const exposure = await watcher._getExposure(era);
+
+  const eraActiveSet = new Set(
+    exposure ? exposure.others.map(n => n.who.toString()) : []
+  );
+
+  // Collect all addresses nominating this validator
+  let allNomAddrs = [];
+  try {
+    const entries = await watcher.api.query.staking.nominators.entries();
+    for (const [key, nomOpt] of entries) {
+      if (nomOpt.isNone) continue;
+      const targets = nomOpt.unwrap().targets.map(t => t.toString());
+      if (!targets.includes(CONFIG.validatorAddress)) continue;
+      allNomAddrs.push(key.args[0].toString());
+    }
+  } catch (e) {
+    console.error('[scanNominators] Scan error:', e.message);
+  }
+  console.log(`[scanNominators] Found: ${allNomAddrs.length} nominators`);
+
+  // Fetch ledger.active for every nominator in parallel batches
+  const BATCH = 30;
+  const allNoms = [];
+  for (let i = 0; i < allNomAddrs.length; i += BATCH) {
+    const batch   = allNomAddrs.slice(i, i + BATCH);
+    const results = await Promise.all(batch.map(async (addr) => {
+      try {
+        let nl = await watcher.api.query.staking.ledger(addr);
+        if (nl.isNone) {
+          const nb = await watcher.api.query.staking.bonded(addr);
+          if (nb.isSome) nl = await watcher.api.query.staking.ledger(nb.unwrap());
+        }
+        return {
+          addr,
+          amount: nl.isSome ? toToken(nl.unwrap().active.toString(), watcher.decimals) : '0',
+          active: eraActiveSet.has(addr),
+        };
+      } catch (_) {
+        return { addr, amount: '0', active: eraActiveSet.has(addr) };
+      }
+    }));
+    allNoms.push(...results);
+  }
+
+  // Persist unified pool
+  const poolMap    = {};
+  const activeMap  = {};
+  const pendingMap = {};
+  for (const n of allNoms) {
+    poolMap[n.addr] = n.amount;
+    if (n.active) activeMap[n.addr] = n.amount;
+    else          pendingMap[n.addr] = n.amount;
+  }
+
+  await state.set('nominators_pool', poolMap);
+  await state.set('pool_bootstrapped', true);
+  await state.set('nominators_active', activeMap);
+  await state.set('nominators', activeMap);
+  await state.set('active_bootstrapped', true);
+  await state.set('nominators_pending', pendingMap);
+  await state.set('nominators_pending_prev', pendingMap);
+  await state.set('pending_bootstrapped', true);
+
+  // Own stake for total
+  let ownStakeNum = 0;
+  try {
+    let ledger = await watcher.api.query.staking.ledger(watcher.addr);
+    if (ledger.isNone) {
+      const bonded = await watcher.api.query.staking.bonded(watcher.addr);
+      if (bonded.isSome) ledger = await watcher.api.query.staking.ledger(bonded.unwrap());
+    }
+    if (ledger.isSome) ownStakeNum = parseFloat(toToken(ledger.unwrap().active.toString(), watcher.decimals));
+  } catch (_) {}
+
+  const grandTotal = (ownStakeNum + allNoms.reduce((s, n) => s + parseFloat(n.amount || 0), 0)).toFixed(4);
+  console.log(`[scanNominators] Done: ${allNoms.filter(n=>n.active).length} active, ${allNoms.filter(n=>!n.active).length} waiting, total: ${grandTotal} ${watcher.token}`);
+
+  return { allNoms, activeNoms: allNoms.filter(n => n.active), pendingNoms: allNoms.filter(n => !n.active), grandTotal };
+}
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -42,6 +128,7 @@ async function main() {
   console.log(`Network   : ${CONFIG.network}`);
   console.log(`AH RPC    : ${CONFIG.rpcEndpoint}`);
   console.log(`RC RPC    : ${CONFIG.rcRpcEndpoint}`);
+  console.log(`Min stake change: ${CONFIG.minStakeChange} ${CONFIG.network === 'kusama' ? 'KSM' : 'DOT'}`);
   console.log('═══════════════════════════════════════════════\n');
 
   const state    = new StateManager(CONFIG.dbPath);
@@ -63,91 +150,35 @@ async function main() {
     oversubLimit:         CONFIG.oversubLimit,
     offlineThreshold:     CONFIG.offlineThreshold,
     onlineThreshold:      CONFIG.onlineThreshold,
+    minStakeChange:       CONFIG.minStakeChange,
   });
 
-  // ── Command providers ──────────────────────────────────────────────────────
-
+  // ── /status ────────────────────────────────────────────────────────────────
   notifier.setStatusProvider(() => watcher.getStatus());
 
+  // ── /nominators — full scan + display ─────────────────────────────────────
   notifier.setNominatorsProvider(async () => {
-    // Fetch ALL nominators via staking.nominators scan, then read ledger.active for each.
-    // ledger.active is the full bonded amount — not the era-capped share from erasStakers.
-    // Active/waiting split is determined by presence in the current era erasStakers.
-    const era      = await watcher._currentEra();
-    const exposure = await watcher._getExposure(era);
-
-    // Active set — era participants (for display tagging only, NOT for stake amounts)
-    const eraActiveSet = new Set(
-      exposure ? exposure.others.map(n => n.who.toString()) : []
-    );
-
-    // Scan all nominators pointing at this validator
-    let allNomAddrs = [];
-    try {
-      const entries = await watcher.api.query.staking.nominators.entries();
-      for (const [key, nomOpt] of entries) {
-        if (nomOpt.isNone) continue;
-        const targets = nomOpt.unwrap().targets.map(t => t.toString());
-        if (!targets.includes(CONFIG.validatorAddress)) continue;
-        allNomAddrs.push(key.args[0].toString());
-      }
-    } catch (e) {
-      console.error('[/nominators] Scan error:', e.message);
-    }
-    console.log(`[/nominators] Total nominators found: ${allNomAddrs.length}`);
-
-    // Fetch ledger.active for every nominator in parallel batches of 30
-    const BATCH = 30;
-    const allNoms = [];
-    for (let i = 0; i < allNomAddrs.length; i += BATCH) {
-      const batch   = allNomAddrs.slice(i, i + BATCH);
-      const results = await Promise.all(batch.map(async (addr) => {
-        try {
-          let nl = await watcher.api.query.staking.ledger(addr);
-          if (nl.isNone) {
-            const nb = await watcher.api.query.staking.bonded(addr);
-            if (nb.isSome) nl = await watcher.api.query.staking.ledger(nb.unwrap());
-          }
-          return { addr, amount: nl.isSome ? toToken(nl.unwrap().active.toString(), watcher.decimals) : '0', active: eraActiveSet.has(addr) };
-        } catch (_) {
-          return { addr, amount: '0', active: eraActiveSet.has(addr) };
-        }
-      }));
-      allNoms.push(...results);
-    }
-
-    const activeNoms  = allNoms.filter(n => n.active);
-    const pendingNoms = allNoms.filter(n => !n.active);
-    const grandTotal  = allNoms.reduce((s, n) => s + parseFloat(n.amount || 0), 0).toFixed(4);
-    console.log(`[/nominators] Done: ${activeNoms.length} active, ${pendingNoms.length} waiting, bonded: ${grandTotal} ${watcher.token}`);
-
-    // Persist unified pool for /status "All bonded" calculation
-    const poolMap = {};
-    for (const n of allNoms) poolMap[n.addr] = n.amount;
-    await state.set('nominators_pool', poolMap);
-    await state.set('pool_bootstrapped', true);
-
-    const activeMap = {};
-    for (const n of activeNoms) activeMap[n.addr] = n.amount;
-    await state.set('nominators_active', activeMap);
-    await state.set('nominators', activeMap);
-    await state.set('active_bootstrapped', true);
-
-    const pendingMap = {};
-    for (const n of pendingNoms) pendingMap[n.addr] = n.amount;
-    await state.set('nominators_pending', pendingMap);
-    await state.set('nominators_pending_prev', pendingMap);
-    await state.set('pending_bootstrapped', true);
-
+    const { activeNoms, pendingNoms } = await scanNominators(watcher, state);
     return Notifier.formatNominators(activeNoms, pendingNoms, watcher.token, CONFIG.validatorAddress);
-  })
+  });
+
+  // ── /update — full scan, update DB only, no display ───────────────────────
+  notifier.setUpdateProvider(async () => {
+    const { activeNoms, pendingNoms, grandTotal } = await scanNominators(watcher, state);
+    return (
+      `✅ <b>Database updated</b>\n` +
+      `Active: <b>${activeNoms.length}</b>  Waiting: <b>${pendingNoms.length}</b>\n` +
+      `Total bonded: <b>${grandTotal} ${watcher.token}</b>`
+    );
+  });
+
+  // ── /history ───────────────────────────────────────────────────────────────
   notifier.setHistoryProvider(async () => {
     const history = await state.get('payout_history', []) || [];
     return Notifier.formatHistory(history, watcher.token || 'DOT');
   });
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
-
   const shutdown = async (signal) => {
     console.log(`\n[Main] ${signal} received — shutting down…`);
     await notifier.stopPolling();
@@ -164,7 +195,6 @@ async function main() {
   });
 
   // ── Start ──────────────────────────────────────────────────────────────────
-
   try {
     await watcher.connect();
     await watcher.startMonitoring();
@@ -173,7 +203,7 @@ async function main() {
       `🚀 <b>Monitor started</b>\n` +
       `Network: <b>${CONFIG.network}</b>\n` +
       `Validator: <code>${CONFIG.validatorAddress}</code>\n` +
-      `/status /nominators /history /help`
+      `/status /nominators /update /history /help`
     );
 
     console.log('\n[Main] Monitoring active. Press Ctrl+C to stop.\n');
