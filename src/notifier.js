@@ -449,9 +449,12 @@ class Notifier {
    * @param {object} r            - Result object from analyzeSlotPosition()
    * @param {string} validatorAddr
    * @param {string} token        - e.g. 'DOT'
+   * @param {object} [opts]
+   * @param {number} [opts.topN=5]      - How many anchors to show (5 = scheduled, 10 = /rank)
+   * @param {boolean} [opts.links=false] - Include Subscan links (true for /rank, false for scheduled)
    * @returns {string[]}          - Array of Telegram HTML messages
    */
-  static formatRank(r, validatorAddr, token) {
+  static formatRank(r, validatorAddr, token, { topN = 5, links = false } = {}) {
     const fmt = (v) => (typeof v === 'number' ? v.toLocaleString('en', { maximumFractionDigits: 2 }) : '—') + ' ' + token;
 
     const header =
@@ -512,37 +515,56 @@ class Notifier {
     // Message 1: summary (always fits)
     const msg1 = header + eraLine + predLine + footer;
 
-    // Message 2: full anchor top-10 with Subscan links
     const messages = [msg1];
+
+    // Anchor block — inline for scheduled (topN=5), separate message for /rank (topN=10)
     if (r.myAnchors && r.myAnchors.length > 0) {
-      const top = r.myAnchors.slice(0, 10);
+      const top      = r.myAnchors.slice(0, topN);
       const excCount = r.exclusiveCount ?? top.filter(n => n.exclusive || n.targets === 1).length;
       const excTotal = r.exclusiveTotal ?? top.filter(n => n.exclusive || n.targets === 1).reduce((s,n) => s + (n.budget||0), 0);
 
-      let anchor =
-        `🎯 <b>Anchor Nominator Analysis</b>\n` +
-        `<code>${validatorAddr}</code>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `🔒 Exclusive (100% to you): <b>${excCount}</b> nominators — <b>${fmt(excTotal)}</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `Top ${top.length} by effective stake:\n`;
+      if (links) {
+        // /rank: detailed second message with Subscan links
+        let anchor =
+          `🎯 <b>Anchor Nominator Analysis</b>\n` +
+          `<code>${validatorAddr}</code>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🔒 Exclusive (100% to you): <b>${excCount}</b> nominators — <b>${fmt(excTotal)}</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━\n` +
+          `Top ${top.length} by effective stake:\n`;
 
-      for (let i = 0; i < top.length; i++) {
-        const n       = top[i];
-        const addr    = n.addr || n.nomAddr || '';
-        const short   = addr ? addr.slice(0, 8) + '…' + addr.slice(-6) : '?';
-        const url     = addr ? `https://assethub-polkadot.subscan.io/account/${addr}` : null;
-        const nameStr = url ? `<a href="${url}">${short}</a>` : `<code>${short}</code>`;
-        const budgetStr  = n.budget   != null ? n.budget.toLocaleString('en', { maximumFractionDigits: 0 })   : '—';
-        const effectStr  = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 0 }) : '—';
-        const exclMark   = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
+        for (let i = 0; i < top.length; i++) {
+          const n         = top[i];
+          const addr      = n.addr || n.nomAddr || '';
+          const shortAddr = addr ? addr.slice(0, 8) + '…' + addr.slice(-6) : '?';
+          const url       = addr ? `https://assethub-polkadot.subscan.io/account/${addr}` : null;
+          const nameStr   = url ? `<a href="${url}">${shortAddr}</a>` : `<code>${shortAddr}</code>`;
+          const budgetStr = n.budget    != null ? n.budget.toLocaleString('en',    { maximumFractionDigits: 0 }) : '—';
+          const effStr    = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 0 }) : '—';
+          const exclMark  = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
 
-        anchor +=
-          `${i + 1}. ${nameStr}${exclMark}\n` +
-          `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  effective: <b>${effectStr} ${token}</b>\n`;
+          anchor +=
+            `${i + 1}. ${nameStr}${exclMark}\n` +
+            `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  effective: <b>${effStr} ${token}</b>\n`;
+        }
+
+        messages.push(anchor);
+      } else {
+        // Scheduled: compact top-5 inline in the first message (insert before footer)
+        const excTotalFmt = excTotal != null ? fmt(excTotal) : '—';
+        let anchorBlock =
+          `${EMOJI.nominator} <b>Top anchors</b>  (excl: ${excCount} → ${excTotalFmt})\n`;
+        for (let i = 0; i < top.length; i++) {
+          const n      = top[i];
+          const addr   = n.addr || n.nomAddr || '';
+          const short  = addr ? addr.slice(0, 8) + '…' : '?…';
+          const excl   = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
+          const effStr = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 1 }) : '—';
+          anchorBlock += `  ${i + 1}. <code>${short}</code>  eff: ${effStr} ${token}  [${n.targets ?? '?'}t]${excl}\n`;
+        }
+        // Rebuild msg1 with anchor inserted before footer
+        messages[0] = header + eraLine + predLine + anchorBlock + footer;
       }
-
-      messages.push(anchor);
     }
 
     return messages;

@@ -130,7 +130,7 @@ function schedulePhragmen(watcher, notifier, state, token) {
     console.log(`[Phragmen] Scheduled run at UTC ${hourUTC}:00`);
     try {
       const result   = await analyzeSlotPosition(watcher.api, CONFIG.validatorAddress, forceRefresh);
-      const messages = Notifier.formatRank(result, CONFIG.validatorAddress, token);
+      const messages = Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 5 });
 
       // Save to state for /rank command
       await state.set('last_rank_result', result);
@@ -213,7 +213,7 @@ async function main() {
     const result = await analyzeSlotPosition(watcher.api, CONFIG.validatorAddress, false);
     await state.set('last_rank_result', result);
     await state.set('last_rank_token', token);
-    return Notifier.formatRank(result, CONFIG.validatorAddress, token);
+    return Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 10, links: true });
   });
 
   // ── /nominators ───────────────────────────────────────────────────────────
