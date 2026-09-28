@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# systemd unit — persistent SSH tunnel to the Polkadot validator RPC
+#
+# Installation:
+#   sudo cp scripts/rpc-tunnel.service /etc/systemd/system/polkamon-rpc-tunnel.service
+#   # Edit the unit below: set User, and the three Environment= lines
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polkamon-rpc-tunnel
+#
+# Check status:
+#   systemctl status polkamon-rpc-tunnel
+#   journalctl -u polkamon-rpc-tunnel -f
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=SSH tunnel — Polkadot validator RPC (polkamon healthcheck)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── Change these three lines ────────────────────────────────────────────────
+User=ubuntu
+Environment=TUNNEL_HOST=1.2.3.4          # IP or hostname of the validator server
+Environment=TUNNEL_USER=ubuntu           # SSH user on the validator server
+Environment=TUNNEL_KEY=/home/ubuntu/.ssh/id_ed25519
+# ── Optional overrides ───────────────────────────────────────────────────────
+Environment=TUNNEL_PORT=22
+Environment=LOCAL_PORT=9933
+Environment=REMOTE_PORT=9933
+Environment=REMOTE_HOST=127.0.0.1
+
+ExecStart=/usr/bin/ssh \
+  -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes \
+  -i  ${TUNNEL_KEY} \
+  -p  ${TUNNEL_PORT} \
+  -L  127.0.0.1:${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT} \
+  ${TUNNEL_USER}@${TUNNEL_HOST}
+
+# Restart immediately if SSH drops
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

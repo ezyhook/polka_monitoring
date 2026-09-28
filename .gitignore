@@ -12,7 +12,7 @@ data/
 .nominators-ledgers.json
 .nominators-self.json
 
-# PM2 logs
+# Logs (PM2 + tunnel)
 logs/
 
 # OS

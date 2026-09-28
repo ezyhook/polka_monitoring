@@ -33,8 +33,8 @@ Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post
 ## Installation
 
 ```bash
-git clone https://github.com/youruser/polkadot-validator-monitor.git
-cd polkadot-validator-monitor
+git clone https://github.com/ezyhook/polka_monitoring.git
+cd polka_monitoring
 npm install
 cp .env.example .env
 # Edit .env with your values
@@ -45,7 +45,7 @@ node index.js
 
 ```bash
 npm install -g pm2
-pm2 start index.js --name polkamon
+pm2 start ecosystem.config.js
 pm2 save
 pm2 startup
 ```
@@ -62,6 +62,50 @@ NODE_RPC_ENDPOINT=http://127.0.0.1:9933  # leave empty to disable node healthche
 ```
 
 See `.env.example` for all options with descriptions.
+
+## Node RPC via SSH Tunnel
+
+If the bot runs on a separate machine from the validator, expose the node's RPC port securely over SSH instead of opening it to the internet.
+
+### Quick start (script)
+
+```bash
+# Edit TUNNEL_HOST (and optionally other variables) in scripts/rpc-tunnel.sh
+TUNNEL_HOST=1.2.3.4 TUNNEL_USER=ubuntu ./scripts/rpc-tunnel.sh start
+./scripts/rpc-tunnel.sh status
+./scripts/rpc-tunnel.sh stop
+```
+
+The script opens `127.0.0.1:9933` locally and forwards it to port `9933` on the validator server. Then set in `.env`:
+
+```env
+NODE_RPC_ENDPOINT=http://127.0.0.1:9933
+```
+
+### Persistent tunnel with systemd
+
+```bash
+# 1. Copy the unit file
+sudo cp scripts/rpc-tunnel.service /etc/systemd/system/polkamon-rpc-tunnel.service
+
+# 2. Edit the unit — set User, TUNNEL_HOST, TUNNEL_USER, TUNNEL_KEY
+sudo nano /etc/systemd/system/polkamon-rpc-tunnel.service
+
+# 3. Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now polkamon-rpc-tunnel
+
+# Check
+systemctl status polkamon-rpc-tunnel
+journalctl -u polkamon-rpc-tunnel -f
+```
+
+The tunnel restarts automatically if SSH drops (`Restart=always`, 10 s delay).
+
+**Pre-requisite:** the bot's SSH key must be authorised on the validator server:
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub ubuntu@<validator-ip>
+```
 
 ## Standalone Scripts
 
