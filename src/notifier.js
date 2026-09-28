@@ -169,10 +169,14 @@ class Notifier {
   }
 
   /** Send a message to the given chat id (used for command replies). */
-  async _reply(chatId, text) {
+  async _reply(chatId, text, opts = {}) {
     try {
       if (text.length > 4096) text = text.slice(0, 4090) + '\n…';
-      await this.bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+      await this.bot.sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...opts,
+      });
     } catch (e) {
       console.error('[Telegram] Reply error:', e.message);
     }
@@ -183,7 +187,10 @@ class Notifier {
   /** Send to the configured chat, bypassing cooldown. */
   async send(text) {
     try {
-      await this.bot.sendMessage(this.chatId, text, { parse_mode: 'HTML' });
+      await this.bot.sendMessage(this.chatId, text, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
     } catch (e) {
       console.error('[Telegram] Send error:', e.message);
     }
