@@ -435,6 +435,101 @@ class Notifier {
     return messages;
   }
 
+  // ── /rank formatter ───────────────────────────────────────────────────────────
+
+  /**
+   * Formats Phragmén slot-position analysis result for Telegram.
+   * @param {object} r            - Result object from analyzeSlotPosition()
+   * @param {string} validatorAddr
+   * @param {string} token        - e.g. 'DOT'
+   * @returns {string[]}          - Array of Telegram HTML messages
+   */
+  static formatRank(r, validatorAddr, token) {
+    const fmt = (v) => (typeof v === 'number' ? v.toLocaleString('en', { maximumFractionDigits: 2 }) : '—') + ' ' + token;
+
+    const header =
+      `${EMOJI.chart} <b>Slot Position Analysis</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━\n` +
+      `Era: <b>${r.era}</b>  Session: <b>${r.sessionIdx}</b>\n` +
+      `Candidates: <b>${r.candidates}</b>  Slots: <b>${r.maxSlots}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━\n`;
+
+    // Current era status (real on-chain data)
+    let eraLine = '';
+    if (r.isActive) {
+      eraLine =
+        `${EMOJI.active} <b>Era status: ACTIVE</b>\n` +
+        `  Rank:    <b>#${r.eraRank}</b>\n` +
+        `  Total:   <b>${fmt(r.eraTotal)}</b>\n` +
+        (r.eraBuffer != null ? `  Buffer:  <b>+${fmt(r.eraBuffer)}</b> over last\n` : '') +
+        `━━━━━━━━━━━━━━━━━━━━━\n`;
+    } else {
+      eraLine =
+        `${EMOJI.inactive} <b>Era status: WAITING</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n`;
+    }
+
+    // Prediction section
+    let predLine = '';
+    if (r.predRank != null) {
+      const safetyPct = r.totalActive > 0
+        ? ((r.totalActive - r.predRank) / r.totalActive * 100).toFixed(1)
+        : null;
+      const danger = r.predRank > r.totalActive * 0.9  ? ` ⚠️ DANGER ZONE`
+                   : r.predRank > r.totalActive * 0.75 ? ` ⚡ CAUTION`
+                   : ` ✅ Comfortable`;
+      predLine =
+        `📐 <b>Prediction (next era)</b>\n` +
+        `  Rank:    <b>#${r.predRank}/${r.totalActive}</b>${danger}\n` +
+        `  Stake:   <b>${fmt(r.predStake)}</b>\n` +
+        (r.predBuffer != null ? `  Buffer:  <b>+${fmt(r.predBuffer)}</b> predicted\n` : '') +
+        `  Safety:  <b>${safetyPct != null ? safetyPct + '%' : '—'}</b> above ejection\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n`;
+    } else if (r.waitRank != null) {
+      const needed = r.marginalStake - (r.predStake || 0);
+      predLine =
+        `📐 <b>Prediction: WAITING</b>\n` +
+        `  Waiting rank: <b>#${r.waitRank}</b>\n` +
+        `  Predicted stake: <b>${fmt(r.predStake)}</b>\n` +
+        `  Need to enter:   <b>+${fmt(needed > 0 ? needed : 0)}</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n`;
+    } else {
+      predLine = `❓ <b>Validator not found in simulation</b>\n━━━━━━━━━━━━━━━━━━━━━\n`;
+    }
+
+    // Nominator anchors
+    let anchorLine = '';
+    if (r.myAnchors && r.myAnchors.length > 0) {
+      anchorLine =
+        `${EMOJI.nominator} <b>Top anchors</b>  ` +
+        `(excl: ${r.exclusiveCount} → ${fmt(r.exclusiveTotal)})\n`;
+      for (let i = 0; i < Math.min(5, r.myAnchors.length); i++) {
+        const n = r.myAnchors[i];
+        const excl = n.targets === 1 ? ' ←excl' : '';
+        anchorLine +=
+          `  ${i + 1}. <code>${n.nomAddr.slice(0, 8)}…</code>` +
+          `  eff: ${n.effective != null ? n.effective.toFixed(1) : '—'} ${token}` +
+          `  [${n.targets}t]${excl}\n`;
+      }
+    }
+
+    const footer =
+      `━━━━━━━━━━━━━━━━━━━━━\n` +
+      `<i>Nominators: ${r.nominators}  Avg targets: ${r.avgTargets?.toFixed(1) ?? '—'}  Time: ${r.elapsed}s</i>\n` +
+      `<i>Rank ±50. Buffer from era data is authoritative.</i>`;
+
+    const full = header + eraLine + predLine + anchorLine + footer;
+
+    // Split if over Telegram limit
+    if (full.length <= 4096) return [full];
+
+    // First message: header + era + prediction
+    const msg1 = header + eraLine + predLine + footer;
+    // Second message: anchors (if any)
+    const msg2 = anchorLine || null;
+    return msg2 ? [msg1, msg2] : [msg1];
+  }
+
   // ── /history formatter ────────────────────────────────────────────────────────
 
   static formatHistory(history, token) {
