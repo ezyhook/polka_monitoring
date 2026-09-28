@@ -53,6 +53,14 @@ class ChainWatcher {
     this._onlineStrikes   = 0;
     this.offlineThreshold = opts.offlineThreshold || 3;
     this.onlineThreshold  = opts.onlineThreshold  || 2;
+
+    // Node HTTP health check (optional — disabled if nodeRpcEndpoint is empty)
+    this.nodeRpc          = opts.nodeRpcEndpoint || '';
+    this._nodeOnline      = null;   // null = unknown, true/false = last known state
+    this._nodeOffStrikes  = 0;
+    this._nodeOnStrikes   = 0;
+    this._nodeHealthTimer = null;
+    this.nodeHealthMs     = opts.nodeHealthInterval || 60_000;
   }
 
   // ── Connection ────────────────────────────────────────────────────────────────
@@ -116,6 +124,7 @@ class ChainWatcher {
     await this._subscribeEvents();
     await this._startHeartbeat();
     await this._loadRecentPayouts();
+    this._startNodeHealthCheck();
     console.log('[Monitor] All subscriptions active.');
   }
 
@@ -464,6 +473,60 @@ class ChainWatcher {
     if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
   }
 
+  // ── Node HTTP health check ────────────────────────────────────────────────────
+
+  _startNodeHealthCheck() {
+    if (!this.nodeRpc) {
+      console.log('[NodeHealth] NODE_RPC_ENDPOINT not set — healthcheck disabled');
+      return;
+    }
+    console.log(`[NodeHealth] Polling ${this.nodeRpc} every ${this.nodeHealthMs / 1000}s`);
+    const check = async () => {
+      try {
+        const res  = await fetch(this.nodeRpc, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'system_health', params: [] }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        const { result } = await res.json();
+        const healthy = result && result.peers > 0 && !result.shouldHavePeers === false;
+        // peers=0 counts as offline; isSyncing does NOT
+        const isDown = !result || result.peers === 0;
+        if (isDown) {
+          this._nodeOnStrikes  = 0;
+          this._nodeOffStrikes++;
+          if (this._nodeOffStrikes >= this.offlineThreshold && this._nodeOnline !== false) {
+            this._nodeOnline = false;
+            console.warn('[NodeHealth] Node OFFLINE (peers=0 or unreachable)');
+            await this.notifier.nodeOffline?.();
+          }
+        } else {
+          this._nodeOffStrikes = 0;
+          this._nodeOnStrikes++;
+          if (this._nodeOnStrikes >= this.onlineThreshold && this._nodeOnline !== true) {
+            const wasOffline = this._nodeOnline === false;
+            this._nodeOnline = true;
+            console.log(`[NodeHealth] Node online — peers: ${result.peers}`);
+            if (wasOffline) await this.notifier.nodeOnline?.();
+          }
+          this._nodeOnline = true;
+        }
+        this._nodeLastPeers = result?.peers ?? null;
+      } catch (_) {
+        this._nodeOnStrikes  = 0;
+        this._nodeOffStrikes++;
+        if (this._nodeOffStrikes >= this.offlineThreshold && this._nodeOnline !== false) {
+          this._nodeOnline = false;
+          console.warn('[NodeHealth] Node unreachable');
+          await this.notifier.nodeOffline?.();
+        }
+      }
+    };
+    check();
+    this._nodeHealthTimer = setInterval(check, this.nodeHealthMs);
+  }
+
   async _notifyOnline() {
     if (this._wasOnline === true) return;
     this._onlineStrikes++;
@@ -488,7 +551,7 @@ class ChainWatcher {
   // ── /status ───────────────────────────────────────────────────────────────────
 
   async getStatus() {
-    if (!this.api) throw new Error('API not connected');
+    if (!this.api) return `⏳ Connecting to chain, please try again in a few seconds…`;
     const Notifier = require('./notifier');
 
     const [era, header] = await Promise.all([
@@ -580,6 +643,9 @@ class ChainWatcher {
       lastPayoutEra, payoutHistory,
       uptimeLabel, isOversubscribed: isOver,
       oversubLimit: this.oversubLimit,
+      nodeRpcConfigured: !!this.nodeRpc,
+      nodeOnline: this._nodeOnline,
+      nodePeers:  this._nodeLastPeers ?? null,
     });
   }
 

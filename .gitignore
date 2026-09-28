@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Environment variables (contains secrets)
+.env
+
+# LevelDB state
+data/
+
+# Nominator cache files
+.nominators-structure.json
+.nominators-ledgers.json
+.nominators-self.json
+
+# PM2 logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

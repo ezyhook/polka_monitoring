@@ -40,6 +40,7 @@ class Notifier {
     this._nominatorsProvider = null;
     this._updateProvider     = null;
     this._historyProvider    = null;
+    this._rankProvider       = null;
 
     this._registerCommands();
   }
@@ -48,6 +49,7 @@ class Notifier {
   setNominatorsProvider(fn) { this._nominatorsProvider = fn; }
   setUpdateProvider(fn)     { this._updateProvider     = fn; }
   setHistoryProvider(fn)    { this._historyProvider    = fn; }
+  setRankProvider(fn)       { this._rankProvider       = fn; }
 
   stopPolling() { return this.bot.stopPolling(); }
 
@@ -106,6 +108,26 @@ class Notifier {
       }
     });
 
+    this.bot.onText(/\/rank/, async (msg) => {
+      if (!guard(msg)) return;
+      console.log('[Bot] Command: /rank');
+      if (!this._rankProvider) {
+        return this._reply(msg.chat.id, `${EMOJI.warn} Rank analysis is not available.`);
+      }
+      const loadingMsg = await this._reply(msg.chat.id, `⏳ Running Phragmén simulation, this may take 1-2 minutes…`);
+      try {
+        const msgs = await this._rankProvider();
+        if (Array.isArray(msgs)) {
+          for (const m of msgs) await this._reply(msg.chat.id, m);
+        } else {
+          await this._reply(msg.chat.id, msgs);
+        }
+      } catch (e) {
+        console.error('[Bot] /rank error:', e);
+        await this._reply(msg.chat.id, `${EMOJI.error} Rank error: <code>${e.message}</code>`);
+      }
+    });
+
     this.bot.onText(/\/history/, async (msg) => {
       if (!guard(msg)) return;
       console.log('[Bot] Command: /history');
@@ -138,6 +160,7 @@ class Notifier {
       { command: 'status',     description: 'Current validator status' },
       { command: 'nominators', description: 'Full nominator list (active & waiting)' },
       { command: 'update',     description: 'Refresh nominator database' },
+      { command: 'rank',       description: 'Slot position & Phragmén prediction' },
       { command: 'history',    description: 'Last 10 reward payouts' },
       { command: 'help',       description: 'List of commands' },
     ]).catch(e => console.error('[Bot] setMyCommands error:', e.message));
@@ -292,7 +315,19 @@ class Notifier {
    * @param {object} s - Status data object (see getStatus() in watcher.js)
    */
   static formatStatus(s) {
-    const onlineStr = s.online ? `${EMOJI.online} online`  : `${EMOJI.offline} offline`;
+    // Node health check line
+    let nodeStr;
+    if (!s.nodeRpcConfigured) {
+      nodeStr = `ℹ️ healthcheck disabled`;
+    } else if (s.nodeOnline === null) {
+      nodeStr = `⏳ checking…`;
+    } else if (s.nodeOnline) {
+      const peersStr = s.nodePeers != null ? ` — peers: ${s.nodePeers}` : '';
+      nodeStr = `${EMOJI.online} online${peersStr}`;
+    } else {
+      nodeStr = `${EMOJI.offline} offline`;
+    }
+
     const activeStr = s.active ? `${EMOJI.active} active`  : `${EMOJI.inactive} waiting`;
     const keysStr   = s.sessionKeys ? trimKey(s.sessionKeys) : (s.sessionKeysNote || 'not set');
     const overStr   = s.isOversubscribed ? ` ${EMOJI.oversub} oversubscribed!` : '';
@@ -325,7 +360,7 @@ class Notifier {
       `Network:     <b>${s.network}</b>\n` +
       `${EMOJI.block} Block:      <b>${s.blockNumber}</b>  Era: <b>${s.era}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
-      `Node:        ${onlineStr}\n` +
+      `Node:        ${nodeStr}\n` +
       `Status:      ${activeStr}\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `${EMOJI.money} Stake:\n` +

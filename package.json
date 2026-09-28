@@ -1,18 +1,21 @@
 {
-  "name": "polka_mon",
+  "name": "polkadot-validator-monitor",
   "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "",
-  "type": "commonjs",
+  "description": "Telegram bot monitoring a Polkadot validator on Asset Hub (post-AHM)",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "slot": "node slot-position.js",
+    "buffer": "node era-buffer.js"
   },
   "dependencies": {
-    "@polkadot/api": "^16.5.6",
-    "dotenv": "^17.4.2",
-    "level": "^10.0.0",
-    "node-telegram-bot-api": "^0.67.0"
-  }
+    "@polkadot/api": "^14.0.0",
+    "dotenv": "^16.0.0",
+    "level": "^8.0.0",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
 }

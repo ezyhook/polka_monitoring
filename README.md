@@ -1,175 +1,121 @@
 # Polkadot Validator Monitor
 
-A self-hosted monitoring bot for a Polkadot (or Kusama) validator, with real-time alerts and on-demand status reports delivered via Telegram.
+Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post-AHM world (November 2025) where staking data lives on Asset Hub while session keys remain on the Relay Chain.
 
-No external infrastructure required — runs as a single Node.js process connecting to public RPC endpoints.
+## Features
 
-## What it monitors
+- **Node health** — polls `system_health` on your validator's HTTP RPC every 60s; alerts on offline/online transitions; disabled automatically if `NODE_RPC_ENDPOINT` is empty
+- **Active/inactive** — tracks era status via `erasStakersOverview`
+- **Nominator changes** — two-tier scan: active nominators every 5 min, waiting (all `staking.nominators`) every 4h; alerts when stake change exceeds `MIN_STAKE_CHANGE` DOT
+- **Payouts** — catches `staking.Rewarded` events; fallback scan via `erasRewardPoints` every ~100 blocks
+- **Session keys** — monitors `session.nextKeys` on Relay Chain every 5 min
+- **Slash / Chill** — instant alerts on `staking.Slashed` and `staking.Chilled` events
+- **Oversubscription** — checks nominator count vs `OVERSUB_LIMIT` every 30 min
+- **Slot position** — Phragmén simulation predicting your rank for the next era; runs on a schedule and on demand via `/rank`
 
-| # | Event | How it's detected |
-|---|-------|--------------------|
-| 1 | Node online / offline | Heartbeat — alert fires after several consecutive missed block intervals |
-| 2 | Validator active / waiting | `staking.erasStakers` (or paged equivalent), checked periodically |
-| 3 | Nominator added / removed / stake changed | Two-tier check: active nominators (`erasStakers`, fast) and waiting nominators (`staking.nominators`, full scan) |
-| 4 | Reward payout received | `staking.Rewarded` event, real-time |
-| 5 | Session key rotation | `session.nextKeys` / `queuedKeys` on the Relay Chain |
-| 6 | Slash | `staking.Slashed` event — sent immediately, no cooldown |
-| 7 | Forced chill | `staking.Chilled` event |
-| 8 | Oversubscription | Nominator count vs. configurable limit (default 512) |
+## Bot Commands
+
+| Command | Description |
+|---|---|
+| `/status` | Current era, rank, stake, session keys, recent payouts |
+| `/nominators` | Full nominator list — active and waiting |
+| `/update` | Refresh nominator database without displaying |
+| `/rank` | Phragmén slot position prediction (~1–2 min) |
+| `/history` | Last 10 reward payouts |
+| `/help` | Command list |
+
+## Requirements
+
+- Node.js 18+
+- A running Polkadot validator (or any SS58 address to monitor)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+
+## Installation
+
+```bash
+git clone https://github.com/youruser/polkadot-validator-monitor.git
+cd polkadot-validator-monitor
+npm install
+cp .env.example .env
+# Edit .env with your values
+node index.js
+```
+
+### Running with PM2
+
+```bash
+npm install -g pm2
+pm2 start index.js --name polkamon
+pm2 save
+pm2 startup
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in the required values:
+
+```env
+VALIDATOR_ADDRESS=14PkBX3B...            # your validator stash address
+TELEGRAM_BOT_TOKEN=123456:ABC...         # from @BotFather
+TELEGRAM_CHAT_ID=-100123456789           # your chat or channel ID
+NODE_RPC_ENDPOINT=http://127.0.0.1:9933  # leave empty to disable node healthcheck
+```
+
+See `.env.example` for all options with descriptions.
+
+## Standalone Scripts
+
+### Era Buffer (`era-buffer.js`)
+
+Shows your validator's real position in the current era — authoritative on-chain data, no simulation.
+
+```bash
+node era-buffer.js                         # uses VALIDATOR_ADDRESS from .env
+node era-buffer.js 15MUBwP6dyVw5...        # any validator address
+```
+
+**Active:** rank, era stake, buffer over last (#600), surrounding ±5 validators.  
+**Waiting:** ledger.active vs threshold, deficit, waiting queue rank.
+
+### Slot Position (`slot-position.js`)
+
+Full Phragmén simulation predicting next-era rank.
+
+```bash
+node slot-position.js                      # uses VALIDATOR_ADDRESS from .env
+node slot-position.js 15MUBwP6dyVw5...     # any validator address
+```
+
+Caches nominator structure, ledger balances, and self-stakes for 1h in `.nominators-*.json` files.
 
 ## Architecture
 
-After the Asset Hub Migration (AHM, November 2025), staking state (exposure, nominators, payouts, rewards) lives on **Asset Hub**, while **session keys** remain on the **Relay Chain**. This monitor connects to both:
-
-- `RPC_ENDPOINT` — Asset Hub (staking, nominators, payouts, rewards)
-- `RC_RPC_ENDPOINT` — Relay Chain (session keys only)
-
-## Quick start
-
-### 1. Install dependencies
-```bash
-npm install
+```
+index.js              — entry point, config, command wiring, Phragmén scheduler
+src/
+  watcher.js          — chain subscriptions, monitoring logic, /status data
+  notifier.js         — Telegram bot, alert templates, command handlers
+  state.js            — LevelDB persistent store
+  phragmen.js         — Phragmén simulation module (slot position)
+slot-position.js      — standalone Phragmén script
+era-buffer.js         — standalone era position script
 ```
 
-### 2. Configure
-```bash
-cp .env.example .env
-nano .env
-```
+### Post-AHM API notes
 
-At minimum, set these three values:
-```env
-VALIDATOR_ADDRESS=1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TELEGRAM_BOT_TOKEN=123456789:AAH...
-TELEGRAM_CHAT_ID=-1001234567890
-```
+After the Asset Hub Migration (AHM, November 2025):
 
-#### Getting a Telegram bot token
-1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
-2. Copy the issued token into `TELEGRAM_BOT_TOKEN`
+- **Staking data** lives on **Asset Hub** (`RPC_ENDPOINT` = `wss://polkadot-asset-hub-rpc.polkadot.io`)
+- **Session keys** remain on **Relay Chain** (`RC_RPC_ENDPOINT` = `wss://rpc.polkadot.io`)
+- `erasStakers` is replaced by `erasStakersOverview` + `erasStakersPaged`
+- `staking.Rewarded` event layout: `data[0]=stash`, `data[2]||data[1]=amount`
 
-#### Getting your chat ID
-- For a private chat: message [@userinfobot](https://t.me/userinfobot)
-- For a group/channel: add the bot as an administrator, send any message, then open:
-  `https://api.telegram.org/bot<TOKEN>/getUpdates`
+## Phragmén Simulation Accuracy
 
-### 3. Run
-```bash
-npm start
-```
+The simulation predicts rank reliably (~±50 positions). Absolute stake values are estimates — the real Phragmén algorithm redistributes large multi-target nominations in ways that are hard to reproduce without exact rational arithmetic.
 
-On successful startup, the bot sends a confirmation message to the configured chat.
+Use the **era buffer from `/rank`** (sourced directly from `erasStakers`) as the authoritative risk measure, not the simulated buffer.
 
-## Bot commands
+## License
 
-| Command | Description |
-|---------|-------------|
-| `/status` | Current validator status: online state, active/waiting, stake, top nominators, session keys, recent payouts, uptime |
-| `/nominators` | Full nominator list, split into **active** (currently earning rewards) and **waiting** (nominated but not in the active set) — may take 30–60s for validators with hundreds of nominators |
-| `/history` | Last 10 reward payouts |
-| `/help` | List of available commands |
-
-## Configuration reference (`.env`)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VALIDATOR_ADDRESS` | — | Validator stash address (SS58) **(required)** |
-| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token **(required)** |
-| `TELEGRAM_CHAT_ID` | — | Target chat/channel ID **(required)** |
-| `RPC_ENDPOINT` | `wss://polkadot-asset-hub-rpc.polkadot.io` | Asset Hub WebSocket RPC |
-| `RC_RPC_ENDPOINT` | `wss://rpc.polkadot.io` | Relay Chain WebSocket RPC (session keys) |
-| `NETWORK` | `polkadot` | Network name shown in alerts |
-| `DB_PATH` | `./data/state.db` | LevelDB state directory |
-| `HEARTBEAT_INTERVAL` | `60000` | Heartbeat check interval (ms) |
-| `NOTIFICATION_COOLDOWN` | `300000` | Minimum pause between same-type alerts (ms) |
-| `NOM_CHECK_INTERVAL` | `300000` | Active nominator check interval (ms) |
-| `KEY_CHECK_INTERVAL` | `300000` | Session key check interval (ms) |
-| `PENDING_CHECK_INTERVAL` | `14400000` | Waiting nominator full-scan interval (ms), default 4h |
-| `OVERSUB_LIMIT` | `512` | Nominator count above which an oversubscription alert fires |
-| `OFFLINE_THRESHOLD` | `3` | Consecutive missed heartbeats before an offline alert fires |
-| `ONLINE_THRESHOLD` | `2` | Consecutive blocks received before an online/recovery alert fires |
-
-### Public RPC endpoints
-
-| Network | Asset Hub (staking) | Relay Chain (session keys) |
-|---------|----------------------|------------------------------|
-| Polkadot | `wss://polkadot-asset-hub-rpc.polkadot.io` | `wss://rpc.polkadot.io` |
-| Kusama | `wss://kusama-asset-hub-rpc.polkadot.io` | `wss://kusama-rpc.polkadot.io` |
-| Westend (testnet) | `wss://westend-asset-hub-rpc.polkadot.io` | `wss://westend-rpc.polkadot.io` |
-
-## Project structure
-
-```
-polkadot-validator-monitor/
-├── index.js          # entry point, configuration, command wiring, graceful shutdown
-├── src/
-│   ├── watcher.js     # chain subscriptions, all monitoring logic, /status data
-│   ├── notifier.js    # Telegram bot, alert templates, command handlers, cooldown
-│   └── state.js        # persistent key-value store (LevelDB)
-├── data/              # created automatically — LevelDB files
-├── .env               # your configuration (do not commit)
-├── .env.example       # configuration template
-└── package.json
-```
-
-## Running as a systemd service (Linux)
-
-Create `/etc/systemd/system/validator-monitor.service`:
-
-```ini
-[Unit]
-Description=Polkadot Validator Monitor
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/validator-monitor
-ExecStart=/usr/bin/node index.js
-Restart=always
-RestartSec=15
-EnvironmentFile=/opt/validator-monitor/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable validator-monitor
-sudo systemctl start validator-monitor
-sudo journalctl -fu validator-monitor
-```
-
-## Running with Docker
-
-`Dockerfile`:
-```dockerfile
-FROM node:22-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --omit=dev
-COPY . .
-VOLUME ["/app/data"]
-CMD ["node", "index.js"]
-```
-
-Run:
-```bash
-docker build -t validator-monitor .
-docker run -d \
-  --name validator-monitor \
-  --restart unless-stopped \
-  -v $(pwd)/data:/app/data \
-  --env-file .env \
-  validator-monitor
-```
-
-## Notes & caveats
-
-- **State persistence**: do not delete the `data/` directory — it holds the baseline used to detect changes (nominators, session keys, active/inactive status, payout history). Deleting it causes the monitor to treat the next check as a fresh bootstrap (no false alerts, but history is reset).
-- **First run**: nominator and session-key baselines are captured silently on the first check — no alerts are fired for pre-existing state.
-- **Active vs. waiting nominators**: "active" nominators are part of the current era's exposure and earn rewards; "waiting" nominators have nominated the validator but are not currently in the active set (e.g. validator not elected, or nominator outside the top-N by stake).
-- **Dust filtering**: nominator stake changes below 1 token are ignored to avoid noise from rounding/fees.
-- **Slashes and chills** are sent immediately, bypassing the cooldown — these are critical events.
-- **Session keys**: read from the Relay Chain (`session.nextKeys` / `queuedKeys`). If the Relay Chain RPC is unreachable, `/status` will show "no Relay Chain connection" but all Asset Hub-based monitoring continues normally.
-- **Offline/online debounce**: a single missed or received block does not trigger an alert — see `OFFLINE_THRESHOLD` / `ONLINE_THRESHOLD`.
+MIT
