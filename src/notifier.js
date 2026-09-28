@@ -497,39 +497,48 @@ class Notifier {
       predLine = `❓ <b>Validator not found in simulation</b>\n━━━━━━━━━━━━━━━━━━━━━\n`;
     }
 
-    // Nominator anchors
-    let anchorLine = '';
-    if (r.myAnchors && r.myAnchors.length > 0) {
-      anchorLine =
-        `${EMOJI.nominator} <b>Top anchors</b>  ` +
-        `(excl: ${r.exclusiveCount} → ${fmt(r.exclusiveTotal)})\n`;
-      for (let i = 0; i < Math.min(5, r.myAnchors.length); i++) {
-        const n = r.myAnchors[i];
-        // phragmen.js stores the address as `addr` (not `nomAddr`)
-        const addrStr = (n.addr || n.nomAddr || '');
-        const excl = (n.exclusive || n.targets === 1) ? ' ←excl' : '';
-        anchorLine +=
-          `  ${i + 1}. <code>${addrStr.slice(0, 8) || '?'}…</code>` +
-          `  eff: ${n.effective != null ? n.effective.toFixed(1) : '—'} ${token}` +
-          `  [${n.targets ?? '?'}t]${excl}\n`;
-      }
-    }
-
     const footer =
       `━━━━━━━━━━━━━━━━━━━━━\n` +
       `<i>Nominators: ${r.nominators}  Avg targets: ${r.avgTargets?.toFixed(1) ?? '—'}  Time: ${r.elapsed}s</i>\n` +
       `<i>Rank ±50. Buffer from era data is authoritative.</i>`;
 
-    const full = header + eraLine + predLine + anchorLine + footer;
-
-    // Split if over Telegram limit
-    if (full.length <= 4096) return [full];
-
-    // First message: header + era + prediction
+    // Message 1: summary (always fits)
     const msg1 = header + eraLine + predLine + footer;
-    // Second message: anchors (if any)
-    const msg2 = anchorLine || null;
-    return msg2 ? [msg1, msg2] : [msg1];
+
+    // Message 2: full anchor top-10 with Subscan links
+    const messages = [msg1];
+    if (r.myAnchors && r.myAnchors.length > 0) {
+      const top = r.myAnchors.slice(0, 10);
+      const excCount = r.exclusiveCount ?? top.filter(n => n.exclusive || n.targets === 1).length;
+      const excTotal = r.exclusiveTotal ?? top.filter(n => n.exclusive || n.targets === 1).reduce((s,n) => s + (n.budget||0), 0);
+
+      let anchor =
+        `🎯 <b>Anchor Nominator Analysis</b>\n` +
+        `<code>${validatorAddr}</code>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🔒 Exclusive (100% to you): <b>${excCount}</b> nominators — <b>${fmt(excTotal)}</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `Top ${top.length} by effective stake:\n`;
+
+      for (let i = 0; i < top.length; i++) {
+        const n       = top[i];
+        const addr    = n.addr || n.nomAddr || '';
+        const short   = addr ? addr.slice(0, 8) + '…' + addr.slice(-6) : '?';
+        const url     = addr ? `https://assethub-polkadot.subscan.io/account/${addr}` : null;
+        const nameStr = url ? `<a href="${url}">${short}</a>` : `<code>${short}</code>`;
+        const budgetStr  = n.budget   != null ? n.budget.toLocaleString('en', { maximumFractionDigits: 0 })   : '—';
+        const effectStr  = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 0 }) : '—';
+        const exclMark   = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
+
+        anchor +=
+          `${i + 1}. ${nameStr}${exclMark}\n` +
+          `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  effective: <b>${effectStr} ${token}</b>\n`;
+      }
+
+      messages.push(anchor);
+    }
+
+    return messages;
   }
 
   // ── /history formatter ────────────────────────────────────────────────────────
