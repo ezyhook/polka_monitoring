@@ -505,11 +505,13 @@ class Notifier {
         `(excl: ${r.exclusiveCount} → ${fmt(r.exclusiveTotal)})\n`;
       for (let i = 0; i < Math.min(5, r.myAnchors.length); i++) {
         const n = r.myAnchors[i];
-        const excl = n.targets === 1 ? ' ←excl' : '';
+        // phragmen.js stores the address as `addr` (not `nomAddr`)
+        const addrStr = (n.addr || n.nomAddr || '');
+        const excl = (n.exclusive || n.targets === 1) ? ' ←excl' : '';
         anchorLine +=
-          `  ${i + 1}. <code>${n.nomAddr.slice(0, 8)}…</code>` +
+          `  ${i + 1}. <code>${addrStr.slice(0, 8) || '?'}…</code>` +
           `  eff: ${n.effective != null ? n.effective.toFixed(1) : '—'} ${token}` +
-          `  [${n.targets}t]${excl}\n`;
+          `  [${n.targets ?? '?'}t]${excl}\n`;
       }
     }
 
