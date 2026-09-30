@@ -37,8 +37,9 @@ module.exports = {
       max_size: '50M',
       retain: 7,
 
-      // Process settings
-      node_args: '--max-old-space-size=512',
+      // Process settings — heap limit raised to 1.5 GB; phragmen analysis
+      // serialises ~24k nominator records to JSON which is memory-intensive.
+      node_args: '--max-old-space-size=1536',
     },
   ],
 };

@@ -62,17 +62,69 @@ async function batchGetLedgers(api, addrs) {
 function readCache(file, ttl) {
   try {
     if (!fs.existsSync(file)) return null;
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const age = Date.now() - raw.savedAt;
+    // Peek at first line to detect format
+    const fd      = fs.openSync(file, 'r');
+    const buf     = Buffer.alloc(256);
+    const bytesRead = fs.readSync(fd, buf, 0, 256, 0);
+    fs.closeSync(fd);
+    const firstLine = buf.slice(0, bytesRead).toString('utf8').split('\n')[0];
+    const header  = JSON.parse(firstLine);
+    const age     = Date.now() - header.savedAt;
     if (age > ttl) return null;
+    if (header.lines) {
+      // Stream ("lines") format
+      const linesResult = readCacheLines(file);
+      if (!linesResult) return null;
+      return { data: linesResult.data, age };
+    }
+    // Legacy single-JSON format
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     return { data: raw.data, age };
   } catch (_) { return null; }
 }
 
 function writeCache(file, data) {
+  // Stream-write the cache to avoid holding a huge serialised string in memory.
+  // Format: first line = {"savedAt":<ts>}\n, then one JSON line per item.
+  // readCache detects this "lines" format via the absence of a top-level "data" key.
   try {
-    fs.writeFileSync(file, JSON.stringify({ data, savedAt: Date.now() }));
+    const tmp = file + '.tmp';
+    const fd  = fs.openSync(tmp, 'w');
+    fs.writeSync(fd, JSON.stringify({ savedAt: Date.now(), lines: true }) + '\n');
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        fs.writeSync(fd, JSON.stringify(item) + '\n');
+      }
+    } else {
+      // Fallback for non-array data (small objects — write as single JSON line)
+      fs.writeSync(fd, JSON.stringify(data) + '\n');
+    }
+    fs.closeSync(fd);
+    fs.renameSync(tmp, file); // atomic replace
   } catch (e) { console.error('[Phragmen] Cache write error:', e.message); }
+}
+
+function readCacheLines(file) {
+  // Read a "lines" format cache line by line to avoid holding the full
+  // serialised string in memory (structure cache can be 100+ MB).
+  try {
+    const content = fs.readFileSync(file, 'utf8');
+    let start = 0;
+    let end   = content.indexOf('\n');
+    if (end < 0) return null;
+    const header = JSON.parse(content.slice(start, end));
+    if (!header.lines) return null;
+    const data = [];
+    start = end + 1;
+    while (start < content.length) {
+      end = content.indexOf('\n', start);
+      const line = end < 0 ? content.slice(start) : content.slice(start, end);
+      if (line.trim()) data.push(JSON.parse(line));
+      if (end < 0) break;
+      start = end + 1;
+    }
+    return { data, age: Date.now() - header.savedAt };
+  } catch (_) { return null; }
 }
 
 function loadStructureCache() {
