@@ -5,7 +5,8 @@ require('dotenv').config();
 const StateManager                    = require('./src/state');
 const Notifier                        = require('./src/notifier');
 const { ChainWatcher, toToken, toFloat } = require('./src/watcher');
-const { analyzeSlotPosition, clearCache, refreshLedgerCache } = require('./src/phragmen');
+const { clearCache, refreshLedgerCache } = require('./src/phragmen');
+const { runPhragmenInChild }          = require('./src/phragmen-runner');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -129,7 +130,7 @@ function schedulePhragmen(watcher, notifier, state, token) {
 
     console.log(`[Phragmen] Scheduled run at UTC ${hourUTC}:00`);
     try {
-      const result   = await analyzeSlotPosition(watcher.api, CONFIG.validatorAddress, forceRefresh);
+      const result   = await runPhragmenInChild(CONFIG.rcRpcEndpoint, CONFIG.validatorAddress, forceRefresh);
       const messages = Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 5 });
 
       // Save to state for /rank command
@@ -209,8 +210,8 @@ async function main() {
   // ── /rank — run fresh Phragmén or return cached ───────────────────────────
   notifier.setRankProvider(async () => {
     const token = watcher.token || 'DOT';
-    // Always run fresh on /rank command
-    const result = await analyzeSlotPosition(watcher.api, CONFIG.validatorAddress, false);
+    // Always run fresh on /rank command (child process keeps monitor heap clean)
+    const result = await runPhragmenInChild(CONFIG.rcRpcEndpoint, CONFIG.validatorAddress, false);
     await state.set('last_rank_result', result);
     await state.set('last_rank_token', token);
     return Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 10, links: true });
