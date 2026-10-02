@@ -14,11 +14,11 @@ const { ApiPromise, WsProvider } = require('@polkadot/api');
 const { analyzeSlotPosition }    = require('./phragmen');
 
 process.on('message', async (msg) => {
-  const { rcRpcEndpoint, validatorAddress, forceRefresh } = msg;
+  const { rpcEndpoint, validatorAddress, forceRefresh } = msg;
 
   let api;
   try {
-    const provider = new WsProvider(rcRpcEndpoint);
+    const provider = new WsProvider(rpcEndpoint);
     api = await ApiPromise.create({ provider });
     await api.isReady;
 

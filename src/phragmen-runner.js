@@ -12,13 +12,13 @@ const path      = require('path');
 const WORKER = path.join(__dirname, 'phragmen-worker.js');
 
 /**
- * @param {string}  rcRpcEndpoint     - Relay-chain WSS endpoint
+ * @param {string}  rpcEndpoint       - Asset Hub WSS endpoint (staking lives here post-AHM)
  * @param {string}  validatorAddress  - SS58 stash address
  * @param {boolean} forceRefresh      - Pass true to skip all caches
  * @param {number}  [timeoutMs]       - Kill the child after this many ms (default 10 min)
  * @returns {Promise<object>}         - analyzeSlotPosition() result
  */
-function runPhragmenInChild(rcRpcEndpoint, validatorAddress, forceRefresh = false, timeoutMs = 10 * 60_000) {
+function runPhragmenInChild(rpcEndpoint, validatorAddress, forceRefresh = false, timeoutMs = 10 * 60_000) {
   return new Promise((resolve, reject) => {
     const child = fork(WORKER, [], {
       // Give the child its own 1.5 GB heap; independent of the monitor process.
@@ -65,7 +65,7 @@ function runPhragmenInChild(rcRpcEndpoint, validatorAddress, forceRefresh = fals
     });
 
     // Send work to child
-    child.send({ rcRpcEndpoint, validatorAddress, forceRefresh });
+    child.send({ rpcEndpoint, validatorAddress, forceRefresh });
   });
 }
 
