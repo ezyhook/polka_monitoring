@@ -259,19 +259,23 @@ class Notifier {
   }
 
   nominatorJoined(addr, stake, newTotal, delta, token) {
-    const sign = parseFloat(delta) >= 0 ? '+' : '';
+    const sign    = parseFloat(delta) >= 0 ? '+' : '';
+    const subscan = `https://assethub-polkadot.subscan.io/account/${addr}`;
     return this.notify(`nom_join_${addr}`,
       `${EMOJI.nominator} <b>New nominator</b>\n` +
       `<code>${addr}</code>\n` +
+      `<a href="${subscan}">Subscan ↗</a>\n` +
       `Stake: <b>${stake} ${token}</b>\n` +
       `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
   }
 
   nominatorLeft(addr, stake, newTotal, delta, token) {
-    const sign = parseFloat(delta) >= 0 ? '+' : '';
+    const sign    = parseFloat(delta) >= 0 ? '+' : '';
+    const subscan = `https://assethub-polkadot.subscan.io/account/${addr}`;
     return this.notify(`nom_left_${addr}`,
       `${EMOJI.nominator} <b>Nominator left</b>\n` +
       `<code>${addr}</code>\n` +
+      `<a href="${subscan}">Subscan ↗</a>\n` +
       `Removed stake: <b>${stake} ${token}</b>\n` +
       `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
   }
@@ -281,9 +285,11 @@ class Notifier {
     const nomSign  = parseFloat(nomDelta) >= 0 ? '+' : '';
     const totSign  = parseFloat(delta) >= 0 ? '+' : '';
     const emoji    = parseFloat(nomDelta) >= 0 ? '📈' : '📉';
+    const subscan  = `https://assethub-polkadot.subscan.io/account/${addr}`;
     return this.notify(`nom_chg_${addr}`,
       `${emoji} <b>Nominator stake changed</b>\n` +
       `<code>${addr}</code>\n` +
+      `<a href="${subscan}">Subscan ↗</a>\n` +
       `${oldStake} → <b>${newStake} ${token}</b>  (${nomSign}${nomDelta})\n` +
       `Total: <b>${newTotal} ${token}</b>  (${totSign}${delta} ${token})`);
   }
