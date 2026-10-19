@@ -250,9 +250,9 @@ async function eraBackers(api, era, validatorAddress) {
  * Anchor list: backers sorted by the stake they give us.
  *   targets   — nominations that are current validators (others can't receive stake)
  *   nominated — all nominations, incl. chilled / removed validators
- *   exclusive — we are their only valid target: structurally 100% to us, every era
- *   full      — gave us ≥99.9% of their stake in this election, though they
- *               have other valid targets (the election's choice, can change)
+ *   exclusive — we are their only valid target: 100% to us in every election.
+ * (Not "gave us 100% this era": the election solution is sparse — ~99% of all
+ * nominators back exactly one validator per era — so that says nothing.)
  */
 function anchorsFrom(backers) {
   const all = backers
@@ -264,18 +264,14 @@ function anchorsFrom(backers) {
       nominated: b.nominated ?? b.targets,
       effective: b.weight,
       exclusive: b.targets === 1,
-      full:      b.targets > 1 && b.budget > 0 && b.weight >= b.budget * 0.999,
     }));
   const sum = (list) => list.reduce((s, n) => s + n.effective, 0);
   const exclusive = all.filter(n => n.exclusive);
-  const full      = all.filter(n => n.full);
   return {
     myAnchors:      all.slice(0, 10),
     backerCount:    all.length,
     exclusiveCount: exclusive.length,
     exclusiveTotal: sum(exclusive),
-    fullCount:      full.length,
-    fullTotal:      sum(full),
   };
 }
 

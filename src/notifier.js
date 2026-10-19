@@ -576,9 +576,7 @@ class Notifier {
       const top      = r.myAnchors.slice(0, topN);
       const excCount = r.exclusiveCount ?? 0;
       const excTotal = r.exclusiveTotal ?? 0;
-      const fullCount = r.fullCount ?? 0;
-      const fullTotal = r.fullTotal ?? 0;
-      const mark = (n) => (n.exclusive ? ' 🔒' : n.full ? ' 💯' : '');
+      const mark = (n) => (n.exclusive ? ' 🔒' : '');
       // "7/16" when some nominations point at non-validators
       const targetsStr = (n) => (n.targets == null ? '?'
         : n.nominated != null && n.nominated !== n.targets ? `${n.targets}/${n.nominated}` : `${n.targets}`);
@@ -590,7 +588,6 @@ class Notifier {
           `<code>${validatorAddr}</code>\n` +
           `━━━━━━━━━━━━━━━━━━━━━\n` +
           `🔒 Exclusive (you are their only validator): <b>${excCount}</b> — <b>${fmt(excTotal)}</b>\n` +
-          `💯 100% of stake to you this era (other targets too): <b>${fullCount}</b> — <b>${fmt(fullTotal)}</b>\n` +
           (r.backerCount != null ? `Backers total: <b>${r.backerCount}</b>\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━\n` +
           `Top ${top.length} by stake given to you:\n`;
@@ -614,7 +611,7 @@ class Notifier {
       } else {
         // Scheduled: compact top-5 inline in the first message (insert before footer)
         let anchorBlock =
-          `${EMOJI.nominator} <b>Top anchors</b>  (🔒 ${excCount} → ${fmt(excTotal)}, 💯 ${fullCount} → ${fmt(fullTotal)})\n`;
+          `${EMOJI.nominator} <b>Top anchors</b>  (🔒 ${excCount} → ${fmt(excTotal)})\n`;
         for (let i = 0; i < top.length; i++) {
           const n      = top[i];
           const addr   = n.addr || n.nomAddr || '';
