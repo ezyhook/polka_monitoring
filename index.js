@@ -6,7 +6,6 @@ const StateManager                    = require('./src/state');
 const Notifier                        = require('./src/notifier');
 const { escapeHtml }                  = require('./src/notifier');
 const { ChainWatcher }                = require('./src/watcher');
-const { clearCache, refreshLedgerCache } = require('./src/phragmen');
 const { runPhragmenInChild }          = require('./src/phragmen-runner');
 const { Lock }                        = require('./src/lock');
 
@@ -62,17 +61,10 @@ function schedulePhragmen(watcher, notifier, state, token) {
     if (rankLock.busy) return;           // /rank in progress — retry on the next tick
     lastRunHour = hourUTC;
 
-    // At 6:00 UTC (9:00 UTC+3) — refresh cache
-    const forceRefresh = (hourUTC === 6);
-    if (forceRefresh) {
-      console.log('[Phragmen] Scheduled refresh — clearing nominator cache');
-      clearCache();
-    }
-
     console.log(`[Phragmen] Scheduled run at UTC ${hourUTC}:00`);
     try {
       const result   = await rankLock.run(() =>
-        runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, forceRefresh));
+        runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, false));
       const messages = Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 5 });
 
       // Save to state for /rank command
@@ -91,23 +83,6 @@ function schedulePhragmen(watcher, notifier, state, token) {
   // Check every minute
   setInterval(() => tick().catch(e => console.error('[Phragmen] Tick error:', e.message)), 60_000);
   console.log(`[Phragmen] Scheduler active. Runs at UTC: ${CONFIG.rankScheduleUTC.join(', ')}:00`);
-  console.log(`[Phragmen] That is UTC+3: ${CONFIG.rankScheduleUTC.map(h => ((h + 3) % 24)).join(', ')}:00`);
-}
-
-// ── Ledger cache auto-refresh ─────────────────────────────────────────────────
-
-function scheduleLedgerCacheRefresh(watcher) {
-  const INTERVAL = 60 * 60_000; // 1 hour
-  setInterval(async () => {
-    console.log('[Phragmen] Auto-refreshing ledger cache…');
-    try {
-      await refreshLedgerCache(watcher.api);
-      console.log('[Phragmen] Ledger cache refreshed');
-    } catch (e) {
-      console.error('[Phragmen] Ledger cache refresh error:', e.message);
-    }
-  }, INTERVAL);
-  console.log('[Phragmen] Ledger cache auto-refresh: every 1h');
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

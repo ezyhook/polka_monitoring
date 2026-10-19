@@ -7,7 +7,9 @@ node_modules/
 # LevelDB state
 data/
 
-# Nominator cache files
+# Nominator / election cache files
+.npos-voters.json
+*.tmp
 .nominators-structure.json
 .nominators-ledgers.json
 .nominators-self.json

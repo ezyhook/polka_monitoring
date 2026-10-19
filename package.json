@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "slot": "node slot-position.js",
-    "buffer": "node era-buffer.js"
+    "buffer": "node era-buffer.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@polkadot/api": "^14.0.0",

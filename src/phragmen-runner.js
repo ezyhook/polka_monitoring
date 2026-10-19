@@ -24,8 +24,9 @@ function runPhragmenInChild(rpcEndpoint, validatorAddress, forceRefresh = false,
       // Give the child its own 1.5 GB heap; independent of the monitor process.
       execArgv: ['--max-old-space-size=1536'],
       // Inherit stdout/stderr so PM2 captures child logs normally.
-      // Set PHRAGMEN_QUIET=1 to suppress child output.
-      silent: !!process.env.PHRAGMEN_QUIET,
+      // PHRAGMEN_QUIET=1 discards child output (ignored, not piped — an unread
+      // pipe would fill up and block the worker).
+      stdio: process.env.PHRAGMEN_QUIET ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'inherit',
     });
 
     let settled = false;

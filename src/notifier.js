@@ -506,53 +506,65 @@ class Notifier {
       `Candidates: <b>${r.candidates}</b>  Slots: <b>${r.maxSlots}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n`;
 
+    const clusterNote = (n) => (n > 0 ? `  <i>${n} validators within ±0.1% of this stake — rank is volatile, watch the buffer</i>\n` : '');
+
     // Current era status (real on-chain data)
     let eraLine = '';
     if (r.isActive) {
       eraLine =
-        `${EMOJI.active} <b>Era status: ACTIVE</b>\n` +
+        `${EMOJI.active} <b>Era ${r.era} (now): ACTIVE</b>\n` +
         `  Rank:    <b>#${r.eraRank}</b>\n` +
         `  Total:   <b>${fmt(r.eraTotal)}</b>\n` +
         (r.eraBuffer != null ? `  Buffer:  <b>+${fmt(r.eraBuffer)}</b> over last\n` : '') +
         `━━━━━━━━━━━━━━━━━━━━━\n`;
     } else {
       eraLine =
-        `${EMOJI.inactive} <b>Era status: WAITING</b>\n` +
+        `${EMOJI.inactive} <b>Era ${r.era} (now): WAITING</b>\n` +
         `━━━━━━━━━━━━━━━━━━━━━\n`;
     }
 
-    // Prediction section
-    let predLine = '';
-    if (r.predRank != null) {
-      const safetyPct = r.totalActive > 0
-        ? ((r.totalActive - r.predRank) / r.totalActive * 100).toFixed(1)
-        : null;
-      const danger = r.predRank > r.totalActive * 0.9  ? ` ⚠️ DANGER ZONE`
-                   : r.predRank > r.totalActive * 0.75 ? ` ⚡ CAUTION`
-                   : ` ✅ Comfortable`;
-      predLine =
-        `📐 <b>Prediction (next era)</b>\n` +
-        `  Rank:    <b>#${r.predRank}/${r.totalActive}</b>${danger}\n` +
-        `  Stake:   <b>${fmt(r.predStake)}</b>\n` +
-        (r.predBuffer != null ? `  Buffer:  <b>+${fmt(r.predBuffer)}</b> predicted\n` : '') +
-        `  Safety:  <b>${safetyPct != null ? safetyPct + '%' : '—'}</b> above ejection\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n`;
-    } else if (r.waitRank != null) {
-      const needed = r.marginalStake - (r.predStake || 0);
-      predLine =
-        `📐 <b>Prediction: WAITING</b>\n` +
-        `  Waiting rank: <b>#${r.waitRank}</b>\n` +
-        `  Predicted stake: <b>${fmt(r.predStake)}</b>\n` +
-        `  Need to enter:   <b>+${fmt(needed > 0 ? needed : 0)}</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n`;
-    } else {
-      predLine = `❓ <b>Validator not found in simulation</b>\n━━━━━━━━━━━━━━━━━━━━━\n`;
-    }
+    const SOURCE = {
+      chain:      'elected — on-chain result',
+      snapshot:   'election running — simulated on the official snapshot',
+      simulation: 'simulated on current state',
+    };
 
+    // One block per projection (next era / forecast)
+    const projectionBlock = (p, title) => {
+      if (!p) return '';
+      const head = `📐 <b>${title} — era ${p.era}</b>\n  <i>${SOURCE[p.source] || p.source}</i>\n`;
+      if (p.rank != null) {
+        // Ejection risk is about stake, not rank: buffer as % of the last elected stake
+        const pct    = p.marginal > 0 && p.buffer != null ? p.buffer / p.marginal * 100 : null;
+        const danger = pct == null ? '' : pct < 5 ? ' ⚠️ DANGER ZONE' : pct < 15 ? ' ⚡ CAUTION' : ' ✅ Comfortable';
+        return head +
+          `  Rank:    <b>#${p.rank}/${p.total}</b>${danger}\n` +
+          `  Stake:   <b>${fmt(p.stake)}</b>\n` +
+          (p.buffer != null ? `  Buffer:  <b>+${fmt(p.buffer)}</b>${pct != null ? ` (${pct.toFixed(1)}% above last)` : ''}\n` : '') +
+          clusterNote(p.cluster) +
+          `━━━━━━━━━━━━━━━━━━━━━\n`;
+      }
+      const needed = p.marginal - (p.stake || 0);
+      return head +
+        `  ${EMOJI.inactive} <b>NOT ELECTED</b>` + (p.waitRank != null ? ` — waiting #${p.waitRank} by approval stake` : '') + `\n` +
+        `  Approval stake: <b>${fmt(p.stake)}</b>\n` +
+        `  Last elected:   <b>${fmt(p.marginal)}</b>\n` +
+        `  Short by:       <b>≈${fmt(needed > 0 ? needed : 0)}</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n`;
+    };
+
+    const predLine = r.next
+      ? projectionBlock(r.next, 'Next era') + projectionBlock(r.forecast, 'Forecast')
+      : `❓ <b>No prediction available</b>\n━━━━━━━━━━━━━━━━━━━━━\n`;
+
+    const sim = r.forecast || (r.next && r.next.source !== 'chain' ? r.next : null);
+    const stats = sim && sim.nominators != null
+      ? `Nominators: ${sim.nominators}  Avg targets: ${sim.avgTargets?.toFixed(1) ?? '—'}  `
+      : '';
     const footer =
       `━━━━━━━━━━━━━━━━━━━━━\n` +
-      `<i>Nominators: ${r.nominators}  Avg targets: ${r.avgTargets?.toFixed(1) ?? '—'}  Time: ${r.elapsed}s</i>\n` +
-      `<i>Rank ±50. Buffer from era data is authoritative.</i>`;
+      `<i>${stats}Time: ${r.elapsed}s</i>\n` +
+      (r.forecast ? `<i>Forecast: changes before the next election snapshot are not included.</i>` : '');
 
     // Message 1: summary (always fits)
     const msg1 = header + eraLine + predLine + footer;
@@ -573,7 +585,7 @@ class Notifier {
           `━━━━━━━━━━━━━━━━━━━━━\n` +
           `🔒 Exclusive (100% to you): <b>${excCount}</b> nominators — <b>${fmt(excTotal)}</b>\n` +
           `━━━━━━━━━━━━━━━━━━━━━\n` +
-          `Top ${top.length} by effective stake:\n`;
+          `Top ${top.length} by stake given to you:\n`;
 
         for (let i = 0; i < top.length; i++) {
           const n         = top[i];
@@ -587,7 +599,7 @@ class Notifier {
 
           anchor +=
             `${i + 1}. ${nameStr}${exclMark}\n` +
-            `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  effective: <b>${effStr} ${token}</b>\n`;
+            `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  to you: <b>${effStr} ${token}</b>\n`;
         }
 
         messages.push(anchor);

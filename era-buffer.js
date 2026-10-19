@@ -17,7 +17,8 @@ require('dotenv').config();
 const { ApiPromise, WsProvider } = require('@polkadot/api');
 
 const RPC_ENDPOINT      = process.env.RPC_ENDPOINT || 'wss://polkadot-asset-hub-rpc.polkadot.io';
-const VALIDATOR_ADDRESS = process.argv[2] || process.env.VALIDATOR_ADDRESS || '14PkBX3BUF71wDh44BLeNby2u7X9ZBu36V28LMcBrdK35yC2';
+const VALIDATOR_ADDRESS = process.argv[2] || process.env.VALIDATOR_ADDRESS || '';
+if (!VALIDATOR_ADDRESS) { console.error('Usage: node era-buffer.js <validator-address>  (or set VALIDATOR_ADDRESS)'); process.exit(1); }
 const DECIMALS          = 10;
 const PLANCK            = BigInt(10 ** DECIMALS);
 const BATCH             = 20;
@@ -51,9 +52,10 @@ async function main() {
   const api = await ApiPromise.create({ provider: new WsProvider(RPC_ENDPOINT, 5_000) });
 
   try {
-    const eraOpt = await api.query.staking.currentEra();
-    const era    = eraOpt.unwrap().toNumber();
-    console.log(`Era: ${era}  Session: ${(await api.query.session.currentIndex()).toNumber()}\n`);
+    // activeEra = era being validated; currentEra may already point at the next (planned) era
+    const activeOpt = await api.query.staking.activeEra();
+    const era       = activeOpt.isSome ? activeOpt.unwrap().index.toNumber() : (await api.query.staking.currentEra()).unwrap().toNumber();
+    console.log(`Era: ${era} (active)  Session: ${(await api.query.session.currentIndex()).toNumber()}\n`);
 
     // Validate intent check
     const prefs     = await api.query.staking.validators(VALIDATOR_ADDRESS).catch(() => null);

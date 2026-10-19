@@ -11,7 +11,7 @@ Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post
 - **Session keys** — monitors `session.nextKeys` on Relay Chain every 5 min
 - **Slash / Chill** — instant alerts on `staking.Slashed` and `staking.Chilled` events
 - **RPC connectivity** — alerts if the monitor's Asset Hub RPC stops delivering blocks
-- **Slot position** — Phragmén simulation predicting your rank for the next era; runs on a schedule and on demand via `/rank`
+- **Slot position** — next era from the on-chain election result (or Seq-Phragmén + balancing on the official snapshot while the election runs), plus a forecast of the following election; scheduled and on demand via `/rank`
 
 ## Bot Commands
 
@@ -20,7 +20,7 @@ Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post
 | `/status` | Current era, rank, stake, session keys, recent payouts |
 | `/nominators` | Full nominator list — active and waiting |
 | `/update` | Refresh nominator database without displaying |
-| `/rank` | Phragmén slot position prediction (~1–2 min) |
+| `/rank` | Next era position + forecast (~5 s cached, ~2 min cold) |
 | `/history` | Last 10 reward payouts |
 | `/help` | Command list |
 
@@ -123,14 +123,15 @@ node era-buffer.js 15MUBwP6dyVw5...        # any validator address
 
 ### Slot Position (`slot-position.js`)
 
-Full Phragmén simulation predicting next-era rank.
+Same analysis as `/rank`, printed to the console.
 
 ```bash
 node slot-position.js                      # uses VALIDATOR_ADDRESS from .env
 node slot-position.js 15MUBwP6dyVw5...     # any validator address
+node slot-position.js 15MUB... --fresh     # ignore the voter cache
 ```
 
-Caches nominator structure, ledger balances, and self-stakes for 1h in `.nominators-*.json` files.
+Caches the voter list (bags-list order, stakes, targets) for 1h in `.npos-voters.json`.
 
 ## Architecture
 
@@ -140,7 +141,11 @@ src/
   watcher.js          — chain subscriptions, monitoring logic, /status data
   notifier.js         — Telegram bot, alert templates, command handlers
   state.js            — LevelDB persistent store
-  phragmen.js         — Phragmén simulation module (slot position)
+  phragmen.js         — slot position analysis (chain result / snapshot / simulation)
+  npos.js             — Seq-Phragmén + balancing (port of sp-npos-elections)
+  phragmen-runner.js  — runs the analysis in a short-lived child process
+  lock.js             — non-blocking mutex for heavy jobs
+test/                 — unit tests (npm test)
 slot-position.js      — standalone Phragmén script
 era-buffer.js         — standalone era position script
 ```
@@ -152,13 +157,21 @@ After the Asset Hub Migration (AHM, November 2025):
 - **Staking data** lives on **Asset Hub** (`RPC_ENDPOINT` = `wss://polkadot-asset-hub-rpc.polkadot.io`)
 - **Session keys** remain on **Relay Chain** (`RC_RPC_ENDPOINT` = `wss://rpc.polkadot.io`)
 - `erasStakers` is replaced by `erasStakersOverview` + `erasStakersPaged`
-- `staking.Rewarded` event layout: `data[0]=stash`, `data[2]||data[1]=amount`
+- `staking.Rewarded` event layout: `stash, dest, amount`; the era comes from the preceding `PayoutStarted`
+- `currentEra` is the *planned* era: the election for era N+1 starts as soon as era N is active. Use `activeEra` for "now".
 
-## Phragmén Simulation Accuracy
+## Slot Position Accuracy
 
-The simulation predicts rank reliably (~±50 positions). Absolute stake values are estimates — the real Phragmén algorithm redistributes large multi-target nominations in ways that are hard to reproduce without exact rational arithmetic.
+On Asset Hub the election for era N+1 runs right after era N starts, so `/rank` shows:
 
-Use the **era buffer from `/rank`** (sourced directly from `erasStakers`) as the authoritative risk measure, not the simulated buffer.
+1. **Next era** — the exported on-chain result (exact). During the ~1h election window: Seq-Phragmén + balancing on the official `multiBlockElection` snapshot.
+2. **Forecast** — the election after that, simulated on current state: voters walked in bags-list order and capped at the snapshot size (32 × 704), exactly like staking builds the snapshot.
+
+Validated on era 2329: on the official snapshot the simulation elected the same 600 validators with a median stake error of 0.00% (p90 0.02%); on current state 0.01% (p90 0.04%).
+
+**Watch the buffer, not the rank.** Balancing pulls supports together — ~190 validators sit within ±0.1% of each other, so a few hundred DOT moves the rank by dozens of places while the buffer barely changes. Danger levels use buffer as % of the last elected stake (<5% danger, <15% caution).
+
+Per-nominator splits ("to you") from a simulation are one of many equivalent balanced solutions; on-chain values are exact.
 
 ## License
 

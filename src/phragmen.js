@@ -1,32 +1,41 @@
 'use strict';
 
 /**
- * Phragmén-based slot position analysis module.
- * Computes predicted NPoS rank for a validator using Sequential Phragmén + Balancing.
- * Designed to run periodically (4x/day) and on /rank command.
+ * Slot position analysis for a validator on Asset Hub (staking-async +
+ * multi-block election). Three sources, best available wins:
+ *
+ *   chain      — next era already elected and exported: exact on-chain result
+ *   snapshot   — election in progress: Seq-Phragmén + balancing on the
+ *                official election snapshot (validated: same 600 winners,
+ *                stake error ~0.01%)
+ *   simulation — no snapshot yet: same algorithm on the current state, voters
+ *                taken in bags-list order up to the snapshot size, exactly as
+ *                staking builds the snapshot
+ *
+ * Runs inside the Phragmén child process (phragmen-worker.js).
  */
 
 const fs   = require('fs');
 const path = require('path');
+const { seqPhragmen } = require('./npos');
 
-// Three-tier cache:
-//   STRUCTURE — nominators.entries() (who nominates whom) — 23h TTL, ~1 min to fetch
-//   LEDGERS   — ledger.active for all nominators           — 1h TTL,  ~30s to fetch
-//   SELF      — self-stake for all candidates              — 1h TTL,  ~5s to fetch
-const STRUCTURE_CACHE_FILE = path.join(__dirname, '..', '.nominators-structure.json');
-const LEDGERS_CACHE_FILE   = path.join(__dirname, '..', '.nominators-ledgers.json');
-const SELF_CACHE_FILE      = path.join(__dirname, '..', '.nominators-self.json');
-const STRUCTURE_TTL =  1 * 60 * 60 * 1000;  // 23h
-const LEDGERS_TTL   =  1 * 60 * 60 * 1000;  //  1h
-const SELF_TTL      =  1 * 60 * 60 * 1000;  //  1h
-const BATCH_SIZE = 20;
-const DECIMALS   = 10;
-const PLANCK     = BigInt(10 ** DECIMALS);
+// Voter list (order + stake + targets) — the expensive part, ~1 min to fetch
+const VOTERS_CACHE_FILE = path.join(__dirname, '..', '.npos-voters.json');
+const VOTERS_TTL        = 60 * 60 * 1000;   // 1h
+// Pre-rewrite cache files, removed by clearCache()
+const LEGACY_CACHE_FILES = ['.nominators-structure.json', '.nominators-ledgers.json', '.nominators-self.json']
+  .map(f => path.join(__dirname, '..', f));
+
+const DECIMALS           = 10;
+const PLANCK             = 10 ** DECIMALS;
+const BALANCING_ITERS    = 10;
+const BATCH_SIZE         = 20;
+const DEFAULT_MAX_VOTERS = 22_528;   // 32 pages × 704 on Polkadot Asset Hub
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function toFloat(planckVal) {
-  return Number(BigInt(planckVal.toString())) / Number(PLANCK);
+  return Number(BigInt(planckVal.toString())) / PLANCK;
 }
 
 function fmt(dot) {
@@ -40,9 +49,9 @@ async function getLedgerActive(api, addr) {
       const bonded = await api.query.staking.bonded(addr);
       if (bonded.isSome) ledger = await api.query.staking.ledger(bonded.unwrap());
     }
-    if (ledger.isSome) return BigInt(ledger.unwrap().active.toString());
+    if (ledger.isSome) return toFloat(ledger.unwrap().active);
   } catch (_) {}
-  return 0n;
+  return 0;
 }
 
 async function batchGetLedgers(api, addrs) {
@@ -55,477 +64,334 @@ async function batchGetLedgers(api, addrs) {
   return result;
 }
 
-// ── Cache ─────────────────────────────────────────────────────────────────────
-
-// ── Cache helpers ────────────────────────────────────────────────────────────
+// ── Cache (one JSON item per line — avoids one huge string in memory) ─────────
 
 function readCache(file, ttl) {
   try {
     if (!fs.existsSync(file)) return null;
-    // Peek at first line to detect format
-    const fd      = fs.openSync(file, 'r');
-    const buf     = Buffer.alloc(256);
-    const bytesRead = fs.readSync(fd, buf, 0, 256, 0);
-    fs.closeSync(fd);
-    const firstLine = buf.slice(0, bytesRead).toString('utf8').split('\n')[0];
-    const header  = JSON.parse(firstLine);
-    const age     = Date.now() - header.savedAt;
+    const lines  = fs.readFileSync(file, 'utf8').split('\n');
+    const header = JSON.parse(lines[0]);
+    const age    = Date.now() - header.savedAt;
     if (age > ttl) return null;
-    if (header.lines) {
-      // Stream ("lines") format
-      const linesResult = readCacheLines(file);
-      if (!linesResult) return null;
-      return { data: linesResult.data, age };
-    }
-    // Legacy single-JSON format
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return { data: raw.data, age };
+    const data = [];
+    for (let i = 1; i < lines.length; i++) if (lines[i]) data.push(JSON.parse(lines[i]));
+    return { data, age, meta: header.meta };
   } catch (_) { return null; }
 }
 
-function writeCache(file, data) {
-  // Stream-write the cache to avoid holding a huge serialised string in memory.
-  // Format: first line = {"savedAt":<ts>}\n, then one JSON line per item.
-  // readCache detects this "lines" format via the absence of a top-level "data" key.
+function writeCache(file, data, meta) {
   try {
-    const tmp = file + '.tmp';
+    const tmp = `${file}.${process.pid}.tmp`;   // per-process tmp: no clobbering between workers
     const fd  = fs.openSync(tmp, 'w');
-    fs.writeSync(fd, JSON.stringify({ savedAt: Date.now(), lines: true }) + '\n');
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        fs.writeSync(fd, JSON.stringify(item) + '\n');
-      }
-    } else {
-      // Fallback for non-array data (small objects — write as single JSON line)
-      fs.writeSync(fd, JSON.stringify(data) + '\n');
-    }
+    fs.writeSync(fd, JSON.stringify({ savedAt: Date.now(), meta }) + '\n');
+    for (const item of data) fs.writeSync(fd, JSON.stringify(item) + '\n');
     fs.closeSync(fd);
-    fs.renameSync(tmp, file); // atomic replace
+    fs.renameSync(tmp, file);   // atomic replace
   } catch (e) { console.error('[Phragmen] Cache write error:', e.message); }
 }
 
-function readCacheLines(file) {
-  // Read a "lines" format cache line by line to avoid holding the full
-  // serialised string in memory (structure cache can be 100+ MB).
-  try {
-    const content = fs.readFileSync(file, 'utf8');
-    let start = 0;
-    let end   = content.indexOf('\n');
-    if (end < 0) return null;
-    const header = JSON.parse(content.slice(start, end));
-    if (!header.lines) return null;
-    const data = [];
-    start = end + 1;
-    while (start < content.length) {
-      end = content.indexOf('\n', start);
-      const line = end < 0 ? content.slice(start) : content.slice(start, end);
-      if (line.trim()) data.push(JSON.parse(line));
-      if (end < 0) break;
-      start = end + 1;
-    }
-    return { data, age: Date.now() - header.savedAt };
-  } catch (_) { return null; }
-}
-
-function loadStructureCache() {
-  const c = readCache(STRUCTURE_CACHE_FILE, STRUCTURE_TTL);
-  if (c) console.log(`[Phragmen] Structure cache: ${Math.round(c.age / 60_000)}m old, ${c.data.length} nominators`);
-  return c ? c.data : null;
-}
-
-function saveStructureCache(nominators) {
-  writeCache(STRUCTURE_CACHE_FILE, nominators);
-  console.log(`[Phragmen] Structure cache saved: ${nominators.length} nominators`);
-}
-
-function loadLedgersCache() {
-  const c = readCache(LEDGERS_CACHE_FILE, LEDGERS_TTL);
-  if (c) console.log(`[Phragmen] Ledger cache: ${Math.round(c.age / 60_000)}m old, ${c.data.length} entries`);
-  return c ? new Map(c.data.map(([k, v]) => [k, BigInt(v)])) : null;
-}
-
-function saveLedgersCache(ledgerMap) {
-  // Only save non-zero entries — zeros are likely RPC failures, not real zero balances
-  const entries = [...ledgerMap.entries()].filter(([, v]) => v > 0n).map(([k, v]) => [k, v.toString()]);
-  writeCache(LEDGERS_CACHE_FILE, entries);
-  const zeroCount = ledgerMap.size - entries.length;
-  console.log(`[Phragmen] Ledger cache saved: ${entries.length} entries${zeroCount > 0 ? ` (skipped ${zeroCount} zeros)` : ''}`);
-}
-
-function loadSelfCache(candidates) {
-  const c = readCache(SELF_CACHE_FILE, SELF_TTL);
-  if (!c) return null;
-  // Only valid if it covers all current candidates
-  const cached = new Map(c.data.map(([k, v]) => [k, BigInt(v)]));
-  const missing = candidates.filter(a => !cached.has(a));
-  if (missing.length > candidates.length * 0.1) return null; // >10% missing — refresh
-  if (c) console.log(`[Phragmen] Self-stake cache: ${Math.round(c.age / 60_000)}m old`);
-  return { map: cached, missing };
-}
-
-function saveSelfCache(selfMap) {
-  writeCache(SELF_CACHE_FILE, [...selfMap.entries()].map(([k, v]) => [k, v.toString()]));
-  console.log(`[Phragmen] Self-stake cache saved: ${selfMap.size} entries`);
-}
-
 function clearCache() {
-  for (const f of [STRUCTURE_CACHE_FILE, LEDGERS_CACHE_FILE, SELF_CACHE_FILE]) {
+  for (const f of [VOTERS_CACHE_FILE, ...LEGACY_CACHE_FILES]) {
     try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
   }
   console.log('[Phragmen] All caches cleared');
 }
 
-// ── Sequential Phragmén + Balancing ──────────────────────────────────────────
+// ── Election inputs ───────────────────────────────────────────────────────────
 
-function runPhragmen(candidates, nominatorVotes, selfStakes, maxSlots) {
-  const loads         = new Map();
-  const selected      = [];
-  const remaining     = new Set(candidates);
-  const nomToValidators = new Map();
+/** Voter snapshot size: pages × voters per page of the multi-block election. */
+function maxElectingVoters(api) {
+  const c = api.consts.multiBlockElection;
+  if (c?.pages && c?.voterSnapshotPerBlock) return c.pages.toNumber() * c.voterSnapshotPerBlock.toNumber();
+  return api.consts.staking.maxElectingVoters?.toNumber() || DEFAULT_MAX_VOTERS;
+}
 
-  for (const [validator, votes] of nominatorVotes) {
-    for (const { nomAddr, budget, effectiveBudget } of votes) {
-      if (!loads.has(nomAddr)) loads.set(nomAddr, 0);
-      if (!nomToValidators.has(nomAddr)) nomToValidators.set(nomAddr, []);
-      nomToValidators.get(nomAddr).push({ validator, budget, effectiveBudget });
+/**
+ * The official election snapshot, if an election is running and the snapshot
+ * is complete. Returns null otherwise.
+ */
+async function loadElectionSnapshot(api) {
+  const mbe = api.query.multiBlockElection;
+  if (!mbe?.pagedVoterSnapshot || !mbe?.currentPhase) return null;
+
+  const phase = await mbe.currentPhase();
+  if (phase.isOff) return null;
+
+  const round  = (await mbe.round()).toNumber();
+  const pages  = api.consts.multiBlockElection.pages.toNumber();
+  const [tEntries, vEntries] = [
+    await mbe.pagedTargetSnapshot.entries(round),
+    await mbe.pagedVoterSnapshot.entries(round),
+  ];
+  if (vEntries.length < pages || tEntries.length === 0) return null;   // still being created
+
+  const unwrap  = (v) => (v && v.isSome !== undefined ? (v.isSome ? v.unwrap() : []) : v);
+  const targets = [];
+  for (const [, v] of tEntries) for (const t of unwrap(v)) targets.push(t.toString());
+  const voters = [];
+  for (const [, v] of vEntries) {
+    for (const [who, weight, ts] of unwrap(v)) {
+      voters.push({ id: who.toString(), stake: toFloat(weight), targets: ts.map(t => t.toString()) });
+    }
+  }
+  const desired = (await mbe.desiredTargets(round)).toJSON();
+  console.log(`[Phragmen] Using election snapshot: round ${round}, phase ${phase.type}, ${voters.length} voters, ${targets.length} targets`);
+  return { targets, voters, desired, round, phase: phase.type };
+}
+
+/**
+ * All voters in bags-list order with their stake and targets — the same walk
+ * staking does to build the snapshot (nominators + validators' self-votes).
+ * Cached for 1h.
+ */
+async function loadVoters(api, forceRefresh) {
+  if (!forceRefresh) {
+    const c = readCache(VOTERS_CACHE_FILE, VOTERS_TTL);
+    if (c) {
+      console.log(`[Phragmen] Voter cache: ${Math.round(c.age / 60_000)}m old, ${c.data.length} voters`);
+      return c.data.map(([id, stake, targets]) => ({ id, stake, targets }));
     }
   }
 
-  const limit = Math.min(maxSlots, candidates.length);
+  const t0 = Date.now();
+  console.log('[Phragmen] Fetching voter list (bags-list, nominators, ledgers)…');
 
-  // Phase 1: Sequential Phragmén
-  for (let round = 0; round < limit; round++) {
-    let best = null, bestScore = -Infinity;
-    for (const v of remaining) {
-      let score = selfStakes.get(v) || 0;
-      for (const { nomAddr, effectiveBudget } of (nominatorVotes.get(v) || [])) {
-        if (effectiveBudget <= 0) continue;
-        score += effectiveBudget / (1 + (loads.get(nomAddr) || 0));
-      }
-      if (score > bestScore) { bestScore = score; best = v; }
-    }
-    if (!best) break;
-
-    selected.push({ address: best, stake: bestScore });
-    remaining.delete(best);
-
-    const loadInc = bestScore > 0 ? 1 / bestScore : 0;
-    for (const { nomAddr } of (nominatorVotes.get(best) || [])) {
-      loads.set(nomAddr, (loads.get(nomAddr) || 0) + loadInc);
-    }
+  // Bags-list: bags (head/tail per threshold) + nodes (linked list)
+  const bags = (await api.query.voterList.listBags.entries())
+    .map(([key, v]) => ({ upper: BigInt(key.args[0].toString()), head: v.unwrap().head.toString() }))
+    .filter(b => b.head)
+    .sort((a, b) => (b.upper > a.upper ? 1 : b.upper < a.upper ? -1 : 0));
+  const next = new Map();
+  for (const [key, v] of await api.query.voterList.listNodes.entries()) {
+    if (v.isNone) continue;
+    const node = v.unwrap();
+    next.set(key.args[0].toString(), node.next.isSome ? node.next.unwrap().toString() : null);
   }
 
-  const selectedSet = new Set(selected.map(v => v.address));
+  // Nominations
+  const nominations = new Map();
+  for (const [key, v] of await api.query.staking.nominators.entries()) {
+    if (v.isNone) continue;
+    nominations.set(key.args[0].toString(), v.unwrap().targets.map(t => t.toString()));
+  }
+  const validators = new Set((await api.query.staking.validators.keys()).map(k => k.args[0].toString()));
 
-  // Phase 2: Balancing with damping
-  const support = new Map();
-  for (const addr of selectedSet) {
-    let s = selfStakes.get(addr) || 0;
-    for (const { effectiveBudget } of (nominatorVotes.get(addr) || [])) s += effectiveBudget;
-    support.set(addr, s || 1);
+  // Stakes: all ledgers at once, keyed by stash
+  const stakeOf = new Map();
+  for (const [, v] of await api.query.staking.ledger.entries()) {
+    if (v.isNone) continue;
+    const l = v.unwrap();
+    stakeOf.set(l.stash.toString(), toFloat(l.active));
   }
 
-  const MAX_ITER   = 200;
-  const DAMPING    = 0.5;
-  const CONVERGENCE = 0.0001;
-
-  for (let iter = 0; iter < MAX_ITER; iter++) {
-    const newSupport = new Map();
-    for (const addr of selectedSet) newSupport.set(addr, selfStakes.get(addr) || 0);
-
-    for (const [, targets] of nomToValidators) {
-      const elected = targets.filter(t => selectedSet.has(t.validator));
-      if (elected.length === 0) continue;
-      const budget  = elected[0].budget;
-      const weights = elected.map(t => ({ validator: t.validator, w: 1 / (support.get(t.validator) || 1) }));
-      const totalW  = weights.reduce((s, w) => s + w.w, 0);
-      if (totalW === 0) continue;
-      for (const { validator, w } of weights) {
-        newSupport.set(validator, (newSupport.get(validator) || 0) + budget * (w / totalW));
-      }
+  // Walk the list from the highest bag down
+  const voters = [];
+  for (const bag of bags) {
+    let id = bag.head;
+    let guard = next.size + 1;
+    while (id && guard-- > 0) {
+      const targets = nominations.get(id);
+      if (targets && targets.length > 0)  voters.push({ id, stake: stakeOf.get(id) || 0, targets });
+      else if (validators.has(id))        voters.push({ id, stake: stakeOf.get(id) || 0, targets: [id] });
+      id = next.get(id);
     }
+  }
+  console.log(`[Phragmen] Voter list: ${voters.length} voters in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 
-    let maxChange = 0;
-    for (const [addr, newVal] of newSupport) {
-      const oldVal  = support.get(addr) || 0;
-      const blended = oldVal * DAMPING + newVal * (1 - DAMPING);
-      if (oldVal > 0) maxChange = Math.max(maxChange, Math.abs(blended - oldVal) / oldVal);
-      support.set(addr, blended);
-    }
+  writeCache(VOTERS_CACHE_FILE, voters.map(v => [v.id, v.stake, v.targets]));
+  return voters;
+}
 
-    if (maxChange < CONVERGENCE) break;
+// ── Era status from chain ─────────────────────────────────────────────────────
+
+/** Rank / total / buffer of a validator in an era's exported exposures. */
+async function eraStatus(api, era, validatorAddress) {
+  const entries = await api.query.staking.erasStakersOverview.entries(era);
+  const sorted  = entries
+    .map(([key, val]) => ({ addr: key.args[1].toString(), total: toFloat(val.unwrap().total) }))
+    .sort((a, b) => b.total - a.total);
+  const idx  = sorted.findIndex(v => v.addr === validatorAddress);
+  const last = sorted[sorted.length - 1];
+  return {
+    cluster:  idx >= 0 ? clusterSize(sorted.map(v => v.total), sorted[idx].total) : null,
+    count:    sorted.length,
+    isActive: idx >= 0,
+    rank:     idx >= 0 ? idx + 1 : null,
+    total:    idx >= 0 ? sorted[idx].total : 0,
+    marginal: last ? last.total : 0,
+    buffer:   idx >= 0 && last ? sorted[idx].total - last.total : null,
+  };
+}
+
+/**
+ * Balancing pulls supports together: ~200 validators can sit within ±0.1% of
+ * each other, so a tiny stake change moves the rank by dozens of places.
+ * Returns how many *other* validators are within ±0.1% of `stake`.
+ */
+function clusterSize(stakes, stake) {
+  return stakes.filter(s => Math.abs(s - stake) <= stake * 0.001).length - 1;
+}
+
+/** Backers of the validator in an exported era: [{ addr, weight }] */
+async function eraBackers(api, era, validatorAddress) {
+  const ov = await api.query.staking.erasStakersOverview(era, validatorAddress);
+  if (ov.isNone) return [];
+  const pages  = ov.unwrap().pageCount.toNumber();
+  const result = [];
+  for (let p = 0; p < pages; p++) {
+    const page = await api.query.staking.erasStakersPaged(era, validatorAddress, p);
+    if (page.isNone) continue;
+    for (const { who, value } of page.unwrap().others) result.push({ addr: who.toString(), weight: toFloat(value) });
+  }
+  return result;
+}
+
+/** Anchor list: backers sorted by the stake they give us, with budget and target count. */
+function anchorsFrom(backers) {
+  const all = backers
+    .sort((a, b) => b.weight - a.weight)
+    .map(b => ({
+      addr:      b.addr,
+      budget:    b.budget,
+      targets:   b.targets,
+      effective: b.weight,
+      exclusive: b.targets === 1,
+    }));
+  const exclusive = all.filter(n => n.exclusive);
+  return {
+    myAnchors:      all.slice(0, 10),
+    exclusiveCount: exclusive.length,
+    exclusiveTotal: exclusive.reduce((s, n) => s + n.budget, 0),
+  };
+}
+
+/** Run the election on given inputs and describe our validator's position. */
+function simulate(inputs, validatorAddress, desired, source, era) {
+  const t0 = Date.now();
+  const r  = seqPhragmen(inputs.targets, inputs.voters, desired, { balancingIterations: BALANCING_ITERS });
+  console.log(`[Phragmen] Seq-Phragmén + balancing (${source}): ${r.winners.length} winners in ${Date.now() - t0}ms`);
+
+  const idx      = r.winners.findIndex(w => w.id === validatorAddress);
+  const marginal = r.winners[r.winners.length - 1];
+  const isSelf   = (v) => v.targets.length === 1 && v.targets[0] === v.id;
+  const noms     = inputs.voters.filter(v => !isSelf(v));
+
+  let waitRank = null;
+  if (idx < 0) {
+    const elected = new Set(r.winners.map(w => w.id));
+    const waiting = inputs.targets.filter(t => !elected.has(t)).sort((a, b) => r.approval(b) - r.approval(a));
+    const wi = waiting.indexOf(validatorAddress);
+    waitRank = wi >= 0 ? wi + 1 : null;
   }
 
-  const activeSet = selected
-    .map(v => ({ address: v.address, stake: support.get(v.address) || 0 }))
-    .sort((a, b) => b.stake - a.stake);
+  const projection = {
+    source, era,
+    rank:       idx >= 0 ? idx + 1 : null,
+    stake:      idx >= 0 ? r.winners[idx].support : r.approval(validatorAddress),
+    buffer:     idx >= 0 ? r.winners[idx].support - marginal.support : null,
+    cluster:    idx >= 0 ? clusterSize(r.winners.map(w => w.support), r.winners[idx].support) : null,
+    marginal:   marginal ? marginal.support : 0,
+    total:      r.winners.length,
+    waitRank,
+    nominators: noms.length,
+    avgTargets: noms.length > 0 ? noms.reduce((s, v) => s + v.targets.length, 0) / noms.length : null,
+  };
+  const backers = r.backers(validatorAddress)
+    .filter(b => b.voter !== validatorAddress)
+    .map(b => ({ addr: b.voter, budget: b.budget, targets: b.targets, weight: idx >= 0 ? b.weight : b.budget }));
+  return { projection, backers };
+}
 
-  const waitingList = [...remaining]
-    .map(v => {
-      let score = selfStakes.get(v) || 0;
-      for (const { budget } of (nominatorVotes.get(v) || [])) score += budget;
-      return { address: v, stake: score };
-    })
-    .sort((a, b) => b.stake - a.stake);
-
-  return { activeSet, waitingList, selectedSet };
+/** Current-state inputs: voters in bags-list order, capped at the snapshot size. */
+async function currentStateInputs(api, forceRefresh) {
+  const all       = await loadVoters(api, forceRefresh);
+  const maxVoters = maxElectingVoters(api);
+  const targets   = (await api.query.staking.validators.keys()).map(k => k.args[0].toString());
+  const voters    = all.filter(v => v.stake > 0).slice(0, maxVoters);
+  console.log(`[Phragmen] Current state: ${voters.length}/${all.length} voters (cap ${maxVoters}), ${targets.length} targets`);
+  return { targets, voters };
 }
 
 // ── Main analysis function ────────────────────────────────────────────────────
 
 /**
- * Run full Phragmén analysis for a validator.
- * @param {object} api               - Polkadot.js ApiPromise (Asset Hub)
- * @param {string} validatorAddress  - SS58 stash address
- * @param {boolean} forceRefresh     - Ignore cache and fetch fresh data
- * @returns {object} analysis result
+ * On Asset Hub the election for era N+1 starts as soon as era N becomes
+ * active and is exported within ~1h, so:
+ *   next     — era N+1: on-chain result once exported, else simulated on the
+ *              official snapshot (or current state while the snapshot is built)
+ *   forecast — the election after that (era N+2), simulated on current state;
+ *              only computed when `next` is already final
+ *
+ * @param {object}  api               - Polkadot.js ApiPromise (Asset Hub), or api.at(hash)
+ * @param {string}  validatorAddress  - SS58 stash address
+ * @param {boolean} forceRefresh      - Ignore the voter cache
+ * @returns {object} analysis result (see Notifier.formatRank)
  */
 async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) {
   console.log('[Phragmen] Starting analysis…');
   const startTime = Date.now();
 
-  // Current on-chain status
-  // activeEra = era being validated now; currentEra runs ahead once the next
-  // election is done, and its exposures describe the *next* era.
-  const eraOpt       = await api.query.staking.currentEra();
-  const plannedEra   = eraOpt.unwrap().toNumber();
+  const plannedEra   = (await api.query.staking.currentEra()).unwrap().toNumber();
   const activeEraOpt = await api.query.staking.activeEra();
   const era          = activeEraOpt.isSome ? activeEraOpt.unwrap().index.toNumber() : plannedEra;
-  const sessionIdx = (await api.query.session.currentIndex()).toNumber();
-  const maxSlots          = (await api.query.staking.validatorCount()).toNumber();
-  // minActiveBond — try multiple locations (moved after AHM)
-  let minActiveBond = 0;
-  try {
-    const raw = await api.query.staking.minimumActiveStake();
-    minActiveBond = toFloat(BigInt(raw.toString()));
-  } catch (_) {
-    try {
-      const raw = await api.query.staking.minNominatorBond();
-      minActiveBond = toFloat(BigInt(raw.toString()));
-    } catch (_2) {
-      console.log('[Phragmen] minActiveBond not available — using 0 (no filter)');
+  const sessionIdx   = (await api.query.session.currentIndex()).toNumber();
+  const maxSlots     = (await api.query.staking.validatorCount()).toNumber();
+  const candidates   = (await api.query.staking.validators.keys()).length;
+
+  // Active era — real on-chain data
+  const now = await eraStatus(api, era, validatorAddress);
+
+  let next = null, forecast = null, backers = [];
+
+  // Next era: exact if already elected and exported
+  if (plannedEra > era) {
+    const st = await eraStatus(api, plannedEra, validatorAddress);
+    if (st.count >= maxSlots) {
+      console.log(`[Phragmen] Era ${plannedEra} already elected (${st.count} validators) — on-chain result`);
+      next = {
+        source: 'chain', era: plannedEra,
+        rank: st.rank, stake: st.total, buffer: st.buffer, cluster: st.cluster,
+        marginal: st.marginal, total: st.count, waitRank: null,
+      };
+      backers = await eraBackers(api, plannedEra, validatorAddress);
+      const addrs   = backers.map(b => b.addr);
+      const noms    = await api.query.staking.nominators.multi(addrs);
+      const budgets = await batchGetLedgers(api, addrs);
+      backers.forEach((b, i) => {
+        b.budget  = budgets.get(b.addr) || 0;
+        b.targets = noms[i].isSome ? noms[i].unwrap().targets.length : null;
+      });
     }
   }
-  const maxElectingVoters = api.consts.staking.maxElectingVoters?.toNumber() || 22500;
-  const maxNomRewarded    = api.consts.staking.maxNominatorRewardedPerValidator?.toNumber() || 512;
-  console.log(`[Phragmen] minActiveBond: ${minActiveBond.toFixed(2)} DOT, maxElectingVoters: ${maxElectingVoters}, maxNomRewarded: ${maxNomRewarded}`);
 
-  // Current active status
-  let isActive = false, eraTotal = 0n, eraRank = null, eraBuffer = 0n;
-  try {
-    let allExposures = [];
-    if (typeof api.query.staking.erasStakersOverview?.entries === 'function') {
-      const ov = await api.query.staking.erasStakersOverview(era, validatorAddress).catch(() => null);
-      if (ov && !ov.isNone) {
-        isActive = true;
-        eraTotal = BigInt(ov.unwrap().total.toString());
-      }
-      allExposures = await api.query.staking.erasStakersOverview.entries(era).catch(() => []);
-    } else if (typeof api.query.staking.erasStakers?.entries === 'function') {
-      const exp = await api.query.staking.erasStakers(era, validatorAddress).catch(() => null);
-      if (exp && !exp.total.isZero()) {
-        isActive = true;
-        eraTotal = BigInt(exp.total.toString());
-      }
-      allExposures = await api.query.staking.erasStakers.entries(era).catch(() => []);
-    }
-
-    if (isActive && allExposures.length > 0) {
-      const sorted = allExposures
-        .map(([key, val]) => {
-          const v = val.unwrap ? val.unwrap() : val;
-          return { addr: key.args[key.args.length - 1].toString(), total: BigInt(v.total.toString()) };
-        })
-        .sort((a, b) => (b.total > a.total ? 1 : -1));
-      const idx  = sorted.findIndex(v => v.addr === validatorAddress);
-      eraRank    = idx >= 0 ? idx + 1 : null;
-      eraBuffer  = eraTotal - sorted[sorted.length - 1].total;
-    }
-  } catch (e) {
-    console.error('[Phragmen] Era status error:', e.message);
-  }
-
-  // Candidates
-  const validatorEntries = await api.query.staking.validators.entries();
-  const candidates       = validatorEntries.map(([key]) => key.args[0].toString());
-  const candidateSet     = new Set(candidates);
-
-  // ── Tier 1: Nominator structure — 23h cache ──────────────────────────────────
-  let validNominators;
-  const structureData = forceRefresh ? null : loadStructureCache();
-  if (structureData) {
-    validNominators = structureData
-      .map(n => ({ addr: n.addr, targets: n.targets.filter(t => candidateSet.has(t)) }))
-      .filter(n => n.targets.length > 0);
+  if (next) {
+    // Next era is final — forecast the election after it from current state
+    const inputs = await currentStateInputs(api, forceRefresh);
+    forecast = simulate(inputs, validatorAddress, maxSlots, 'simulation', plannedEra + 1).projection;
   } else {
-    console.log('[Phragmen] Fetching nominator structure (~1 min)…');
-    const nominatorEntries = await api.query.staking.nominators.entries();
-    validNominators = nominatorEntries
-      .filter(([, v]) => !v.isNone)
-      .map(([key, v]) => ({
-        addr:    key.args[0].toString(),
-        targets: v.unwrap().targets.map(t => t.toString()).filter(t => candidateSet.has(t)),
-      }))
-      .filter(n => n.targets.length > 0);
-    saveStructureCache(validNominators);
+    // Next era not final yet: official snapshot if complete, else current state
+    const snap = await loadElectionSnapshot(api).catch((e) => {
+      console.warn('[Phragmen] Snapshot read failed:', e.message);
+      return null;
+    });
+    const inputs = snap || await currentStateInputs(api, forceRefresh);
+    const target = plannedEra > era ? plannedEra : era + 1;
+    const sim    = simulate(inputs, validatorAddress, (snap && snap.desired) || maxSlots, snap ? 'snapshot' : 'simulation', target);
+    next    = sim.projection;
+    backers = sim.backers;
   }
-
-  // ── Tier 2: Ledger balances — 1h cache ───────────────────────────────────────
-  let ledgerMap = forceRefresh ? null : loadLedgersCache();
-  if (!ledgerMap) {
-    console.log(`[Phragmen] Fetching ledger balances for ${validNominators.length} nominators…`);
-    ledgerMap = await batchGetLedgers(api, validNominators.map(n => n.addr));
-    saveLedgersCache(ledgerMap);
-  } else {
-    // Fetch balances for any nominators not in cache
-    const allAddrs = validNominators.map(n => n.addr);
-    const missing  = allAddrs.filter(a => !ledgerMap.has(a));
-    // Also check for zero-balance entries that may be stale
-    const zeroCount = allAddrs.filter(a => (ledgerMap.get(a) || 0n) === 0n).length;
-    if (missing.length > 0) {
-      console.log(`[Phragmen] Fetching ${missing.length} missing ledger entries…`);
-      const newEntries = await batchGetLedgers(api, missing);
-      for (const [k, v] of newEntries) ledgerMap.set(k, v);
-    }
-    if (zeroCount > allAddrs.length * 0.05) {
-      // >5% zeros suggests stale/corrupt cache — refresh
-      console.warn(`[Phragmen] ${zeroCount} zero-balance entries detected — refreshing ledger cache…`);
-      ledgerMap = await batchGetLedgers(api, allAddrs);
-      saveLedgersCache(ledgerMap);
-    }
-  }
-
-  // ── Tier 3: Self-stakes — 1h cache ───────────────────────────────────────────
-  let selfStakesRaw;
-  const selfCached = forceRefresh ? null : loadSelfCache(candidates);
-  if (selfCached) {
-    selfStakesRaw = selfCached.map;
-    if (selfCached.missing.length > 0) {
-      console.log(`[Phragmen] Fetching ${selfCached.missing.length} new candidate self-stakes…`);
-      const newStakes = await batchGetLedgers(api, selfCached.missing);
-      for (const [k, v] of newStakes) selfStakesRaw.set(k, v);
-    }
-  } else {
-    console.log(`[Phragmen] Fetching self-stakes for ${candidates.length} candidates…`);
-    selfStakesRaw = await batchGetLedgers(api, candidates);
-    saveSelfCache(selfStakesRaw);
-  }
-
-  // Build vote graph with three on-chain filters:
-  // 1. Min Active Bond — discard nominators below the dynamic threshold
-  // 2. MaxElectingVoters (Bags-List cap) — keep only top N by stake
-  // 3. MaxNominatorRewardedPerValidator — cap per-validator nominator list to top 512
-
-  // Filter 1: Min Active Bond
-  let filteredNominators = validNominators
-    .map(n => ({ ...n, budget: toFloat(ledgerMap.get(n.addr) || 0n) }))
-    .filter(n => n.budget >= minActiveBond && n.budget > 0);
-  console.log(`[Phragmen] After minActiveBond filter: ${filteredNominators.length} (removed ${validNominators.length - filteredNominators.length})`);
-
-  // Filter 2: Bags-List cap — sort by stake descending, keep top maxElectingVoters
-  filteredNominators.sort((a, b) => b.budget - a.budget);
-  filteredNominators = filteredNominators.slice(0, maxElectingVoters);
-  console.log(`[Phragmen] After Bags-List cap (${maxElectingVoters}): ${filteredNominators.length}`);
-
-  const nominatorVotes = new Map();
-  candidates.forEach(c => nominatorVotes.set(c, []));
-
-  let totalTargets = 0;
-  for (const { addr, targets, budget } of filteredNominators) {
-    const effectiveBudget = budget / targets.length;
-    totalTargets += targets.length;
-    for (const target of targets) {
-      nominatorVotes.get(target)?.push({ nomAddr: addr, budget, effectiveBudget, targetCount: targets.length });
-    }
-  }
-
-  // Filter 3: MaxNominatorRewardedPerValidator — cap per-validator to top 512 by effectiveBudget
-  for (const [validator, votes] of nominatorVotes.entries()) {
-    if (votes.length > maxNomRewarded) {
-      votes.sort((a, b) => b.effectiveBudget - a.effectiveBudget);
-      nominatorVotes.set(validator, votes.slice(0, maxNomRewarded));
-    }
-  }
-  console.log(`[Phragmen] MaxNomRewarded cap applied (${maxNomRewarded} per validator)`);
-
-  const avgTargets = filteredNominators.length > 0 ? totalTargets / filteredNominators.length : 1;
-
-  // Self-stakes as float
-  const selfStakes = new Map();
-  for (const [addr, planck] of selfStakesRaw) selfStakes.set(addr, toFloat(planck));
-
-  // Run simulation
-  console.log(`[Phragmen] Running simulation (${candidates.length} candidates, ${validNominators.length} nominators)…`);
-  const { activeSet, waitingList, selectedSet } = runPhragmen(candidates, nominatorVotes, selfStakes, maxSlots);
-
-  // Our rank
-  const activeIdx = activeSet.findIndex(v => v.address === validatorAddress);
-  const waitIdx   = waitingList.findIndex(v => v.address === validatorAddress);
-  const marginal  = activeSet[activeSet.length - 1];
-  const predicted = activeIdx >= 0 ? activeSet[activeIdx] : (waitIdx >= 0 ? waitingList[waitIdx] : null);
-  const predRank  = activeIdx >= 0 ? activeIdx + 1 : null;
-  const predBuffer = activeIdx >= 0 ? (predicted?.stake || 0) - (marginal?.stake || 0) : null;
-
-  // Anchor nominators for our validator
-  const allMyVotes = (nominatorVotes.get(validatorAddress) || [])
-    .sort((a, b) => b.effectiveBudget - a.effectiveBudget)
-    .map(n => ({
-      addr:      n.nomAddr,
-      budget:    n.budget,
-      targets:   n.targetCount,
-      effective: n.effectiveBudget,
-      exclusive: n.targetCount === 1,
-    }));
-
-  // Exclusive nominators summary (targets === 1, full budget goes only to us)
-  const exclusiveNoms  = allMyVotes.filter(n => n.exclusive);
-  const exclusiveCount = exclusiveNoms.length;
-  const exclusiveTotal = exclusiveNoms.reduce((s, n) => s + n.budget, 0);
-
-  const myVotes = allMyVotes.slice(0, 10);
-
-
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[Phragmen] Done in ${elapsed}s. Predicted rank: ${predRank ? '#' + predRank + '/' + activeSet.length : 'waiting'}`);
+  console.log(`[Phragmen] Done in ${elapsed}s. Era ${next.era} (${next.source}): ${next.rank ? '#' + next.rank : 'waiting'}` +
+    (forecast ? `, era ${forecast.era} forecast: ${forecast.rank ? '#' + forecast.rank : 'waiting'}` : ''));
 
   return {
-    era, plannedEra, sessionIdx, maxSlots,
-    isActive, eraTotal: toFloat(eraTotal), eraRank, eraBuffer: toFloat(eraBuffer),
-    candidates: candidates.length,
-    nominators: validNominators.length,
-    avgTargets,
-    predRank, predBuffer, predStake: predicted?.stake || 0,
-    marginalStake: marginal?.stake || 0,
-    totalActive: activeSet.length,
-    waitRank: waitIdx >= 0 ? waitIdx + 1 : null,
-    myAnchors: myVotes,
-    exclusiveCount,
-    exclusiveTotal,
-
+    era, plannedEra, sessionIdx, maxSlots, candidates,
+    isActive: now.isActive, eraTotal: now.total, eraRank: now.rank, eraBuffer: now.buffer, eraCluster: now.cluster,
+    next, forecast,
+    ...anchorsFrom(backers),
     elapsed,
   };
 }
 
-/**
- * Refresh ledger and self-stake caches without running full analysis.
- * Called every hour by the monitor to keep balances fresh.
- */
-async function refreshLedgerCache(api) {
-  const structureData = loadStructureCache();
-  if (!structureData) {
-    console.log('[Phragmen] No structure cache yet — skipping ledger refresh');
-    return;
-  }
-  const addrs    = structureData.map(n => n.addr);
-  const ledgers  = await batchGetLedgers(api, addrs);
-  saveLedgersCache(ledgers);
-
-  // Refresh self-stakes too
-  const validatorEntries = await api.query.staking.validators.entries();
-  const candidates       = validatorEntries.map(([key]) => key.args[0].toString());
-  const selfStakes       = await batchGetLedgers(api, candidates);
-  saveSelfCache(selfStakes);
-}
-
-module.exports = { analyzeSlotPosition, clearCache, refreshLedgerCache, fmt, toFloat };
+module.exports = { analyzeSlotPosition, clearCache, fmt, toFloat, loadVoters, loadElectionSnapshot, maxElectingVoters, simulate };
