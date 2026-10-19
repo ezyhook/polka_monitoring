@@ -19,16 +19,59 @@ const EMOJI = {
   chart:     '📊',
   slash:     '⚡',
   chill:     '❄️',
-  oversub:   '🔶',
   history:   '📜',
   uptime:    '⏱',
 };
+
+const TG_LIMIT = 4000;   // Telegram hard limit is 4096; keep headroom
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** Escape text for Telegram HTML parse mode. */
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** Strip tags for the plain-text fallback when Telegram rejects our HTML. */
+function stripHtml(s) {
+  return String(s)
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Split a message at line boundaries so no chunk exceeds TG_LIMIT.
+ * All our tags open and close on the same line, so this never cuts a tag.
+ */
+function splitMessage(text, limit = TG_LIMIT) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let chunk = '';
+  for (const line of text.split('\n')) {
+    if (line.length > limit) {
+      if (chunk) { chunks.push(chunk); chunk = ''; }
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
+    }
+    if (chunk && chunk.length + 1 + line.length > limit) { chunks.push(chunk); chunk = ''; }
+    chunk = chunk ? chunk + '\n' + line : line;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+
+const subscanUrl = (addr) => `https://assethub-polkadot.subscan.io/account/${addr}`;
 
 class Notifier {
   /**
    * @param {string}       token      - Telegram bot token
    * @param {string|number} chatId    - Target chat / channel id
-   * @param {number}       cooldownMs - Minimum ms between same-type alerts
+   * @param {number}       cooldownMs - Minimum ms between same-type non-critical alerts
    */
   constructor(token, chatId, cooldownMs = 300_000) {
     this.bot         = new TelegramBot(token, { polling: true });
@@ -59,94 +102,62 @@ class Notifier {
     // Only respond to the configured chat
     const guard = (msg) => String(msg.chat.id) === this.chatId;
 
-    this.bot.onText(/\/status/, async (msg) => {
-      if (!guard(msg)) return;
-      console.log('[Bot] Command: /status');
+    // Exact command match: "/rank" or "/rank@botname", not "/ranking"
+    const command = (name, handler) => {
+      this.bot.onText(new RegExp(`^/${name}(?:@\\w+)?(?:\\s|$)`), async (msg) => {
+        if (!guard(msg)) return;
+        console.log(`[Bot] Command: /${name}`);
+        try {
+          await handler(msg.chat.id);
+        } catch (e) {
+          if (e.name !== 'BusyError') console.error(`[Bot] /${name} error:`, e);
+          const icon = e.name === 'BusyError' ? EMOJI.clock : EMOJI.error;
+          await this._reply(msg.chat.id, `${icon} <code>${escapeHtml(e instanceof Error ? e.message : e)}</code>`);
+        }
+      });
+    };
+
+    const replyAll = async (chatId, result) => {
+      for (const m of (Array.isArray(result) ? result : [result])) await this._reply(chatId, m);
+    };
+
+    command('status', async (chatId) => {
       if (!this._statusProvider) {
-        return this._reply(msg.chat.id, `${EMOJI.warn} Monitor is still initialising, please try again shortly.`);
+        return this._reply(chatId, `${EMOJI.warn} Monitor is still initialising, please try again shortly.`);
       }
-      try {
-        const result = await this._statusProvider();
-        await this._reply(msg.chat.id, result);
-      } catch (e) {
-        console.error('[Bot] /status error:', e);
-        const text = e instanceof Error ? e.message : String(e);
-        await this._reply(msg.chat.id, `${EMOJI.error} Error: <code>${text}</code>`);
-      }
+      await this._reply(chatId, await this._statusProvider());
     });
 
-    this.bot.onText(/\/nominators/, async (msg) => {
-      if (!guard(msg)) return;
-      console.log('[Bot] Command: /nominators');
-      if (!this._nominatorsProvider) {
-        return this._reply(msg.chat.id, `${EMOJI.warn} No nominator data available.`);
-      }
-      try {
-        await this._reply(msg.chat.id, `${EMOJI.clock} Loading nominators, please wait…`);
-        const result   = await this._nominatorsProvider();
-        // formatNominators returns an array of messages to stay within Telegram limits
-        const messages = Array.isArray(result) ? result : [result];
-        for (const m of messages) {
-          await this._reply(msg.chat.id, m);
-        }
-      } catch (e) {
-        console.error('[Bot] /nominators error:', e);
-        await this._reply(msg.chat.id, `${EMOJI.error} Error: <code>${String(e.message || e)}</code>`);
-      }
+    command('nominators', async (chatId) => {
+      if (!this._nominatorsProvider) return this._reply(chatId, `${EMOJI.warn} No nominator data available.`);
+      // Providers call onStart once they hold the lock, so a busy reply isn't preceded by "loading…"
+      const onStart = () => this._reply(chatId, `${EMOJI.clock} Loading nominators, please wait…`);
+      await replyAll(chatId, await this._nominatorsProvider(onStart));
     });
 
-    this.bot.onText(/\/update/, async (msg) => {
-      if (!guard(msg)) return;
-      console.log('[Bot] Command: /update');
-      if (!this._updateProvider) return this._reply(msg.chat.id, `${EMOJI.warn} Not available.`);
-      try {
-        await this._reply(msg.chat.id, `${EMOJI.clock} Scanning nominators and updating database…`);
-        await this._reply(msg.chat.id, await this._updateProvider());
-      } catch (e) {
-        console.error('[Bot] /update error:', e);
-        await this._reply(msg.chat.id, `${EMOJI.error} Error: <code>${String(e.message || e)}</code>`);
-      }
+    command('update', async (chatId) => {
+      if (!this._updateProvider) return this._reply(chatId, `${EMOJI.warn} Not available.`);
+      const onStart = () => this._reply(chatId, `${EMOJI.clock} Scanning nominators and updating database…`);
+      await this._reply(chatId, await this._updateProvider(onStart));
     });
 
-    this.bot.onText(/\/rank/, async (msg) => {
-      if (!guard(msg)) return;
-      console.log('[Bot] Command: /rank');
-      if (!this._rankProvider) {
-        return this._reply(msg.chat.id, `${EMOJI.warn} Rank analysis is not available.`);
-      }
-      const loadingMsg = await this._reply(msg.chat.id, `⏳ Running Phragmén simulation, this may take 1-2 minutes…`);
-      try {
-        const msgs = await this._rankProvider();
-        if (Array.isArray(msgs)) {
-          for (const m of msgs) await this._reply(msg.chat.id, m);
-        } else {
-          await this._reply(msg.chat.id, msgs);
-        }
-      } catch (e) {
-        console.error('[Bot] /rank error:', e);
-        await this._reply(msg.chat.id, `${EMOJI.error} Rank error: <code>${e.message}</code>`);
-      }
+    command('rank', async (chatId) => {
+      if (!this._rankProvider) return this._reply(chatId, `${EMOJI.warn} Rank analysis is not available.`);
+      const onStart = () => this._reply(chatId, `⏳ Running Phragmén simulation, this may take 1-2 minutes…`);
+      await replyAll(chatId, await this._rankProvider(onStart));
     });
 
-    this.bot.onText(/\/history/, async (msg) => {
-      if (!guard(msg)) return;
-      console.log('[Bot] Command: /history');
-      if (!this._historyProvider) {
-        return this._reply(msg.chat.id, `${EMOJI.warn} Payout history is empty.`);
-      }
-      try {
-        await this._reply(msg.chat.id, await this._historyProvider());
-      } catch (e) {
-        await this._reply(msg.chat.id, `${EMOJI.error} Error: <code>${e.message}</code>`);
-      }
+    command('history', async (chatId) => {
+      if (!this._historyProvider) return this._reply(chatId, `${EMOJI.warn} Payout history is empty.`);
+      await this._reply(chatId, await this._historyProvider());
     });
 
-    this.bot.onText(/\/help/, async (msg) => {
-      if (!guard(msg)) return;
-      await this._reply(msg.chat.id,
+    command('help', async (chatId) => {
+      await this._reply(chatId,
         `<b>Available commands:</b>\n\n` +
         `/status — current validator status\n` +
         `/nominators — full nominator list (active &amp; waiting)\n` +
+        `/rank — slot position &amp; Phragmén prediction\n` +
         `/history — last 10 payouts\n` +
         `/update — refresh nominator database (no display)\n` +
         `/help — this help message`
@@ -168,35 +179,59 @@ class Notifier {
     console.log('[Bot] Commands registered, polling started');
   }
 
+  // ── Sending ───────────────────────────────────────────────────────────────────
+
+  /**
+   * Send one chunk with retries: honours 429 retry_after, retries 5xx/network
+   * errors with backoff, and falls back to plain text if Telegram rejects the HTML.
+   */
+  async _sendChunk(chatId, text) {
+    let opts = { parse_mode: 'HTML', disable_web_page_preview: true };
+    const MAX_ATTEMPTS = 4;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.bot.sendMessage(chatId, text, opts);
+      } catch (e) {
+        const status = e.response?.statusCode;
+        const desc   = e.response?.body?.description || e.message;
+        if (attempt >= MAX_ATTEMPTS) throw e;
+        if (status === 429) {
+          const retryAfter = e.response?.body?.parameters?.retry_after ?? 5;
+          console.warn(`[Telegram] 429 — retrying in ${retryAfter}s`);
+          await sleep(retryAfter * 1000 + 500);
+        } else if (status === 400 && opts.parse_mode && /parse entities/i.test(desc)) {
+          console.warn('[Telegram] HTML rejected, resending as plain text:', desc);
+          text = stripHtml(text);
+          opts = { disable_web_page_preview: true };
+        } else if ((status && status >= 500) || e.code === 'EFATAL') {
+          console.warn(`[Telegram] ${desc} — retry ${attempt}/${MAX_ATTEMPTS - 1}`);
+          await sleep(2_000 * attempt);
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
   /** Send a message to the given chat id (used for command replies). */
-  async _reply(chatId, text, opts = {}) {
+  async _reply(chatId, text) {
     try {
-      if (text.length > 4096) text = text.slice(0, 4090) + '\n…';
-      await this.bot.sendMessage(chatId, text, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        ...opts,
-      });
+      for (const chunk of splitMessage(text)) await this._sendChunk(chatId, chunk);
     } catch (e) {
       console.error('[Telegram] Reply error:', e.message);
     }
   }
 
-  // ── Push alerts ───────────────────────────────────────────────────────────────
-
   /** Send to the configured chat, bypassing cooldown. */
   async send(text) {
     try {
-      await this.bot.sendMessage(this.chatId, text, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      });
+      for (const chunk of splitMessage(text)) await this._sendChunk(this.chatId, chunk);
     } catch (e) {
       console.error('[Telegram] Send error:', e.message);
     }
   }
 
-  /** Send with per-type cooldown to prevent alert flooding. */
+  /** Send with per-type cooldown — only for non-critical, potentially noisy alerts. */
   async notify(type, text) {
     const now  = Date.now();
     const last = this.lastSent[type] || 0;
@@ -206,27 +241,53 @@ class Notifier {
   }
 
   // ── Alert templates ───────────────────────────────────────────────────────────
+  //
+  // State-change alerts (chain/node up/down, active/waiting) are edge-triggered by
+  // the watcher, so they bypass the cooldown — otherwise a quick flap would
+  // swallow the second "down" alert forever.
 
-  validatorOnline(addr, network) {
-    return this.notify('online',
-      `${EMOJI.online} <b>Validator online</b>\n` +
-      `Network: <b>${network}</b>\n<code>${addr}</code>`);
+  chainOnline(rpc, network, recovered) {
+    return this.send(recovered
+      ? `${EMOJI.online} <b>RPC connection restored</b> — blocks are arriving again\n` +
+        `Network: <b>${network}</b>\n<code>${escapeHtml(rpc)}</code>`
+      : `${EMOJI.online} <b>Connected to chain</b>\n` +
+        `Network: <b>${network}</b>\n<code>${escapeHtml(rpc)}</code>`);
   }
 
-  validatorOffline(addr, network) {
-    return this.notify('offline',
-      `${EMOJI.offline} <b>Validator OFFLINE!</b>\n` +
-      `Network: <b>${network}</b>\n<code>${addr}</code>`);
+  chainOffline(rpc, network, silentSec) {
+    return this.send(
+      `${EMOJI.offline} <b>RPC connection lost</b> — no new blocks` +
+      (silentSec != null ? ` for ${silentSec}s` : '') + `\n` +
+      `Network: <b>${network}</b>\n<code>${escapeHtml(rpc)}</code>\n` +
+      `<i>This is the monitor's RPC, not your validator node.</i>`);
+  }
+
+  nodeOffline(endpoint, reason) {
+    return this.send(
+      `${EMOJI.offline} <b>Validator node OFFLINE!</b>\n` +
+      `Reason: ${escapeHtml(reason)}\n<code>${escapeHtml(endpoint)}</code>`);
+  }
+
+  nodeSyncing(endpoint, peers) {
+    return this.send(
+      `${EMOJI.warn} <b>Validator node is syncing</b> (not producing at tip)\n` +
+      `Peers: <b>${peers}</b>\n<code>${escapeHtml(endpoint)}</code>`);
+  }
+
+  nodeOnline(endpoint, peers) {
+    return this.send(
+      `${EMOJI.online} <b>Validator node healthy</b>\n` +
+      `Peers: <b>${peers}</b>\n<code>${escapeHtml(endpoint)}</code>`);
   }
 
   validatorActive(addr, era) {
-    return this.notify('active',
+    return this.send(
       `${EMOJI.active} <b>Validator is ACTIVE</b>\n` +
       `Era: <b>${era}</b>\n<code>${addr}</code>`);
   }
 
   validatorInactive(addr, era) {
-    return this.notify('inactive',
+    return this.send(
       `${EMOJI.inactive} <b>Validator is WAITING</b>\n` +
       `Era: <b>${era}</b>\n<code>${addr}</code>`);
   }
@@ -245,60 +306,42 @@ class Notifier {
       `<code>${addr}</code>`);
   }
 
-  oversubscribed(addr, count, limit) {
-    return this.notify('oversub',
-      `${EMOJI.oversub} <b>Validator oversubscribed</b>\n` +
-      `Nominators: <b>${count}</b> (limit: ${limit})\n` +
-      `Nominators beyond the limit receive no rewards!\n` +
-      `<code>${addr}</code>`);
-  }
-
-  oversubscribedResolved(addr, count, limit) {
-    return this.notify('oversub_resolved',
-      `${EMOJI.ok} Nominator count back to normal: <b>${count}/${limit}</b>\n<code>${addr}</code>`);
-  }
-
-  nominatorJoined(addr, stake, newTotal, delta, token) {
-    const sign    = parseFloat(delta) >= 0 ? '+' : '';
-    const subscan = `https://assethub-polkadot.subscan.io/account/${addr}`;
-    return this.notify(`nom_join_${addr}`,
+  nominatorJoined(addr, stake, poolTotal, token) {
+    return this.send(
       `${EMOJI.nominator} <b>New nominator</b>\n` +
       `<code>${addr}</code>\n` +
-      `<a href="${subscan}">Subscan ↗</a>\n` +
-      `Stake: <b>${stake} ${token}</b>\n` +
-      `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
+      `<a href="${subscanUrl(addr)}">Subscan ↗</a>\n` +
+      `Stake: <b>+${stake} ${token}</b>\n` +
+      `Pool total: <b>${poolTotal} ${token}</b>`);
   }
 
-  nominatorLeft(addr, stake, newTotal, delta, token) {
-    const sign    = parseFloat(delta) >= 0 ? '+' : '';
-    const subscan = `https://assethub-polkadot.subscan.io/account/${addr}`;
-    return this.notify(`nom_left_${addr}`,
+  nominatorLeft(addr, stake, poolTotal, token) {
+    return this.send(
       `${EMOJI.nominator} <b>Nominator left</b>\n` +
       `<code>${addr}</code>\n` +
-      `<a href="${subscan}">Subscan ↗</a>\n` +
-      `Removed stake: <b>${stake} ${token}</b>\n` +
-      `Total: <b>${newTotal} ${token}</b>  (${sign}${delta} ${token})`);
+      `<a href="${subscanUrl(addr)}">Subscan ↗</a>\n` +
+      `Removed stake: <b>-${stake} ${token}</b>\n` +
+      `Pool total: <b>${poolTotal} ${token}</b>`);
   }
 
-  nominatorStakeChanged(addr, oldStake, newStake, newTotal, delta, token) {
+  nominatorStakeChanged(addr, oldStake, newStake, poolTotal, token) {
     const nomDelta = (parseFloat(newStake) - parseFloat(oldStake)).toFixed(4);
     const nomSign  = parseFloat(nomDelta) >= 0 ? '+' : '';
-    const totSign  = parseFloat(delta) >= 0 ? '+' : '';
     const emoji    = parseFloat(nomDelta) >= 0 ? '📈' : '📉';
-    const subscan  = `https://assethub-polkadot.subscan.io/account/${addr}`;
-    return this.notify(`nom_chg_${addr}`,
+    return this.send(
       `${emoji} <b>Nominator stake changed</b>\n` +
       `<code>${addr}</code>\n` +
-      `<a href="${subscan}">Subscan ↗</a>\n` +
-      `${oldStake} → <b>${newStake} ${token}</b>  (${nomSign}${nomDelta})\n` +
-      `Total: <b>${newTotal} ${token}</b>  (${totSign}${delta} ${token})`);
+      `<a href="${subscanUrl(addr)}">Subscan ↗</a>\n` +
+      `${oldStake} → <b>${newStake} ${token}</b>  (<b>${nomSign}${nomDelta}</b>)\n` +
+      `Pool total: <b>${poolTotal} ${token}</b>`);
   }
 
-  payoutReceived(validatorAddr, era, amount, token) {
-    return this.notify(`payout_${era}`,
+  payoutReceived(validatorAddr, era, amount, eraTotal, token) {
+    const totalStr = eraTotal && eraTotal !== amount ? `\nEra total so far: <b>${eraTotal} ${token}</b>` : '';
+    return this.send(
       `${EMOJI.money} <b>Payout for era ${era}</b>\n` +
       `<code>${short(validatorAddr)}</code>\n` +
-      `Amount: <b>${amount} ${token}</b>`);
+      `Amount: <b>${amount} ${token}</b>` + totalStr);
   }
 
   /** Session key change is always sent, no cooldown. */
@@ -313,12 +356,7 @@ class Notifier {
   connectionError(rpc, err) {
     return this.notify('conn_error',
       `${EMOJI.error} <b>RPC connection error</b>\n` +
-      `<code>${rpc}</code>\n${err}`);
-  }
-
-  reconnected(rpc) {
-    return this.notify('reconnected',
-      `${EMOJI.ok} RPC connection restored\n<code>${rpc}</code>`);
+      `<code>${escapeHtml(rpc)}</code>\n${escapeHtml(err)}`);
   }
 
   // ── /status formatter ─────────────────────────────────────────────────────────
@@ -332,18 +370,18 @@ class Notifier {
     let nodeStr;
     if (!s.nodeRpcConfigured) {
       nodeStr = `ℹ️ healthcheck disabled`;
-    } else if (s.nodeOnline === null) {
-      nodeStr = `⏳ checking…`;
-    } else if (s.nodeOnline) {
-      const peersStr = s.nodePeers != null ? ` — peers: ${s.nodePeers}` : '';
-      nodeStr = `${EMOJI.online} online${peersStr}`;
     } else {
-      nodeStr = `${EMOJI.offline} offline`;
+      const peersStr = s.nodePeers != null ? ` — peers: ${s.nodePeers}` : '';
+      nodeStr = s.nodeState === 'online'  ? `${EMOJI.online} online${peersStr}`
+              : s.nodeState === 'syncing' ? `${EMOJI.warn} syncing${peersStr}`
+              : s.nodeState === 'offline' ? `${EMOJI.offline} offline`
+              : `⏳ checking…`;
     }
+    const rpcStr = s.online ? `${EMOJI.online} receiving blocks` : `${EMOJI.offline} no new blocks`;
 
     const activeStr = s.active ? `${EMOJI.active} active`  : `${EMOJI.inactive} waiting`;
     const keysStr   = s.sessionKeys ? trimKey(s.sessionKeys) : (s.sessionKeysNote || 'not set');
-    const overStr   = s.isOversubscribed ? ` ${EMOJI.oversub} oversubscribed!` : '';
+    const pagesStr  = s.exposurePages > 1 ? ` (${s.exposurePages} exposure pages)` : '';
 
     // Top nominators block
     let nominatorLines = '';
@@ -373,6 +411,7 @@ class Notifier {
       `Network:     <b>${s.network}</b>\n` +
       `${EMOJI.block} Block:      <b>${s.blockNumber}</b>  Era: <b>${s.era}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
+      `RPC:         ${rpcStr}\n` +
       `Node:        ${nodeStr}\n` +
       `Status:      ${activeStr}\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -381,7 +420,7 @@ class Notifier {
       `  Era active:  <b>${s.eraTotal} ${s.token}</b>\n` +
       `  All bonded:  <b>${s.poolTotal ? s.poolTotal + ' ' + s.token : '— run /nominators to load'}</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━━\n` +
-      `${EMOJI.nominator} Nominators:${overStr}\n` +
+      `${EMOJI.nominator} Nominators:${pagesStr}\n` +
       `  ${EMOJI.active} Active:   <b>${s.nominatorCount}</b>\n` +
       `  ${EMOJI.inactive} Waiting:  <b>${s.pendingCount != null ? s.pendingCount : '—'}</b>  <i>/nominators</i>\n` +
       `  Total:    <b>${s.allNomCount + 1}</b> (incl. self)` +
@@ -404,10 +443,7 @@ class Notifier {
    * Returns an array of messages to handle Telegram's 4096-char limit.
    */
   static formatNominators(activeNoms, pendingNoms, token, validatorAddr) {
-    const esc = (s) => String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+    const esc = escapeHtml;
 
     const activeSorted  = [...activeNoms].sort((a, b) => parseFloat(b.amount) - parseFloat(a.amount));
     const pendingSorted = [...pendingNoms].sort((a, b) => parseFloat(b.amount) - parseFloat(a.amount));
@@ -602,3 +638,4 @@ function trimKey(key) {
 }
 
 module.exports = Notifier;
+module.exports.escapeHtml = escapeHtml;

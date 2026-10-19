@@ -285,8 +285,12 @@ async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) 
   const startTime = Date.now();
 
   // Current on-chain status
-  const eraOpt     = await api.query.staking.currentEra();
-  const era        = eraOpt.unwrap().toNumber();
+  // activeEra = era being validated now; currentEra runs ahead once the next
+  // election is done, and its exposures describe the *next* era.
+  const eraOpt       = await api.query.staking.currentEra();
+  const plannedEra   = eraOpt.unwrap().toNumber();
+  const activeEraOpt = await api.query.staking.activeEra();
+  const era          = activeEraOpt.isSome ? activeEraOpt.unwrap().index.toNumber() : plannedEra;
   const sessionIdx = (await api.query.session.currentIndex()).toNumber();
   const maxSlots          = (await api.query.staking.validatorCount()).toNumber();
   // minActiveBond — try multiple locations (moved after AHM)
@@ -486,7 +490,7 @@ async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) 
   console.log(`[Phragmen] Done in ${elapsed}s. Predicted rank: ${predRank ? '#' + predRank + '/' + activeSet.length : 'waiting'}`);
 
   return {
-    era, sessionIdx, maxSlots,
+    era, plannedEra, sessionIdx, maxSlots,
     isActive, eraTotal: toFloat(eraTotal), eraRank, eraBuffer: toFloat(eraBuffer),
     candidates: candidates.length,
     nominators: validNominators.length,

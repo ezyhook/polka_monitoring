@@ -10,7 +10,7 @@ function toToken(value, decimals) {
   const str = value.toString();
   if (str.includes('.')) return str;
   const n      = BigInt(str);
-  const factor = BigInt(10 ** decimals);
+  const factor = 10n ** BigInt(decimals);
   const whole  = n / factor;
   const frac   = n % factor;
   return `${whole}.${frac.toString().padStart(decimals, '0').slice(0, 4)}`;
@@ -24,6 +24,10 @@ function toFloat(value, decimals) {
   return str.includes('.') ? parseFloat(str) : parseFloat(toToken(str, decimals));
 }
 
+const { Lock } = require('./lock');
+
+const PERBILL = 1_000_000_000n;
+
 class ChainWatcher {
   constructor(opts) {
     this.rpc            = opts.rpcEndpoint;
@@ -36,7 +40,6 @@ class ChainWatcher {
     this.nomCheckMs     = opts.nomCheckInterval     || 5 * 60_000;
     this.keyCheckMs     = opts.keyCheckInterval     || 5 * 60_000;
     this.pendingCheckMs = opts.pendingCheckInterval || 4 * 60 * 60_000;
-    this.oversubLimit   = opts.oversubLimit         || 512;
     this.minStakeChange = opts.minStakeChange       || 100;  // minimum DOT change to trigger alert
 
     this.api     = null;
@@ -51,16 +54,24 @@ class ChainWatcher {
     this._unsubs          = [];
     this._offlineStrikes  = 0;
     this._onlineStrikes   = 0;
+    this._blockBusy       = false;
     this.offlineThreshold = opts.offlineThreshold || 3;
     this.onlineThreshold  = opts.onlineThreshold  || 2;
 
+    // Full nominator scan — shared by the periodic check and /update, /nominators
+    this.poolLock = new Lock('Nominator scan');
+
     // Node HTTP health check (optional — disabled if nodeRpcEndpoint is empty)
-    this.nodeRpc          = opts.nodeRpcEndpoint || '';
-    this._nodeOnline      = null;   // null = unknown, true/false = last known state
-    this._nodeOffStrikes  = 0;
-    this._nodeOnStrikes   = 0;
+    this.nodeRpc              = opts.nodeRpcEndpoint || '';
+    this.nodeHealthMs         = opts.nodeHealthInterval   || 60_000;
+    this.nodeOfflineThreshold = opts.nodeOfflineThreshold || this.offlineThreshold;
+    this.nodeOnlineThreshold  = opts.nodeOnlineThreshold  || this.onlineThreshold;
+    this.nodeSyncThreshold    = opts.nodeSyncThreshold    || 5;
+    this._nodeState       = null;   // null (unknown) | 'online' | 'syncing' | 'offline'
+    this._nodeCandidate   = null;   // state being confirmed by consecutive checks
+    this._nodeStrikes     = 0;
+    this._nodeLastPeers   = null;
     this._nodeHealthTimer = null;
-    this.nodeHealthMs     = opts.nodeHealthInterval || 60_000;
   }
 
   // ── Connection ────────────────────────────────────────────────────────────────
@@ -68,7 +79,9 @@ class ChainWatcher {
   async connect() {
     console.log(`[Chain] Connecting to Asset Hub: ${this.rpc}`);
     const provider = new WsProvider(this.rpc, 5_000);
-    provider.on('disconnected', () => { console.warn('[Chain] AH disconnected'); this._handleOffline(); });
+    // Disconnects are handled by the heartbeat (strike-based), not here —
+    // WsProvider reconnects on its own and a short blip shouldn't alert.
+    provider.on('disconnected', () => console.warn('[Chain] AH disconnected'));
     provider.on('connected',    () => console.log('[Chain] AH connected'));
     provider.on('error',        (e) => console.error('[Chain] AH error:', e.message));
 
@@ -83,38 +96,36 @@ class ChainWatcher {
     }
     console.log(`[Chain] Network: ${this.network}, token: ${this.token}, decimals: ${this.decimals}`);
 
-    try {
-      const rcProvider = new WsProvider(this.rcRpc, 5_000);
-      rcProvider.on('disconnected', async () => {
-        console.warn('[Chain] RC disconnected — session keys unavailable until reconnected');
-        this.rcApi = null;
-      });
-      rcProvider.on('connected', async () => {
-        console.log('[Chain] RC reconnected');
-        if (!this.rcApi) {
-          try {
-            this.rcApi = await ApiPromise.create({ provider: rcProvider });
-          } catch (_) {}
-        }
-      });
-      rcProvider.on('error', (e) => console.error('[Chain] RC error:', e.message));
-      this.rcApi = await Promise.race([
-        ApiPromise.create({ provider: rcProvider }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('RC connect timeout')), 15_000)),
-      ]);
-      console.log(`[Chain] Relay Chain connected: ${this.rcRpc}`);
-    } catch (e) {
-      console.warn(`[Chain] Relay Chain connection failed (${e.message}) — session keys unavailable`);
-    }
+    // Relay Chain — a single ApiPromise; WsProvider reconnects it automatically,
+    // so we only check rcApi.isConnected before use instead of recreating it.
+    const rcProvider = new WsProvider(this.rcRpc, 5_000);
+    rcProvider.on('disconnected', () => console.warn('[Chain] RC disconnected — session keys unavailable until reconnected'));
+    rcProvider.on('connected',    () => console.log('[Chain] RC connected'));
+    rcProvider.on('error',        (e) => console.error('[Chain] RC error:', e.message));
+    const rcReady = ApiPromise.create({ provider: rcProvider }).then((api) => {
+      this.rcApi = api;
+      console.log(`[Chain] Relay Chain ready: ${this.rcRpc}`);
+      return api;
+    });
+    rcReady.catch((e) => console.warn(`[Chain] Relay Chain init failed (${e.message}) — session keys unavailable`));
+    await Promise.race([
+      rcReady,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('RC connect timeout — will keep trying in background')), 15_000)),
+    ]).catch((e) => console.warn(`[Chain] ${e.message}`));
 
     await this._notifyOnline();
   }
 
+  _rcAvailable() {
+    return !!(this.rcApi && this.rcApi.isConnected);
+  }
+
   async disconnect() {
     this._stopHeartbeat();
+    if (this._nodeHealthTimer) { clearInterval(this._nodeHealthTimer); this._nodeHealthTimer = null; }
     for (const unsub of this._unsubs) { try { unsub(); } catch (_) {} }
     if (this.rcApi) await this.rcApi.disconnect().catch(() => {});
-    if (this.api)   await this.api.disconnect();
+    if (this.api)   await this.api.disconnect().catch(() => {});
   }
 
   // ── Start ─────────────────────────────────────────────────────────────────────
@@ -131,33 +142,68 @@ class ChainWatcher {
   // ── Block subscription ────────────────────────────────────────────────────────
 
   async _subscribeNewBlocks() {
-    const unsub = await this.api.rpc.chain.subscribeNewHeads(async (header) => {
+    // polkadot.js does not await subscription callbacks — every async handler
+    // must catch its own errors, otherwise a transient RPC error becomes an
+    // unhandled rejection and kills the process.
+    const unsub = await this.api.rpc.chain.subscribeNewHeads((header) => {
       this._lastBlock = Date.now();
-      const blockNum  = header.number.toNumber();
-      if (this._wasOnline === false || this._wasOnline === null) await this._notifyOnline();
-      await this._checkActiveSet(blockNum);
-      await this._checkNominators();
-      await this._checkSessionKeys();
-      await this._checkOversubscribed();
+      this._onNewBlock(header.number.toNumber())
+        .catch(e => console.error('[Block] Handler error:', e.message));
     });
     this._unsubs.push(unsub);
+  }
+
+  async _onNewBlock(blockNum) {
+    if (this._wasOnline !== true) await this._notifyOnline();
+    if (this._blockBusy) return;   // previous block's checks still running — skip
+    this._blockBusy = true;
+    try {
+      await this._safe('ActiveSet',  () => this._checkActiveSet(blockNum));
+      await this._safe('Nominators', () => this._checkNominators());
+      await this._safe('Keys',       () => this._checkSessionKeys());
+    } finally {
+      this._blockBusy = false;
+    }
+  }
+
+  async _safe(name, fn) {
+    try { await fn(); }
+    catch (e) { console.error(`[${name}] Error:`, e.message); }
   }
 
   // ── Event subscription ────────────────────────────────────────────────────────
 
   async _subscribeEvents() {
-    const unsub = await this.api.query.system.events(async (events) => {
-      for (const { event } of events) {
-        const { section, method, data } = event;
+    const unsub = await this.api.query.system.events((events) => {
+      this._onEvents(events).catch(e => console.error('[Events] Handler error:', e.message));
+    });
+    this._unsubs.push(unsub);
+  }
+
+  async _onEvents(events) {
+    // Rewarded carries no era — take it from the PayoutStarted that precedes it
+    // in the same block (one PayoutStarted per payout_stakers page).
+    let payoutEra = null;
+
+    for (const { event } of events) {
+      const { section, method, data } = event;
+      try {
+        if (section === 'staking' && method === 'PayoutStarted') {
+          // (era_index, validator_stash, page, next)
+          payoutEra = data[1].toString() === this.addr ? data[0].toNumber() : null;
+        }
 
         if (section === 'staking' && method === 'Rewarded') {
           const [stash, , amount] = data;
           if (stash.toString() === this.addr) {
-            const amtStr = toToken(amount.toString(), this.decimals);
-            const era    = await this._currentEra();
-            await this.state.set('last_payout_era', era);
-            await this._savePayoutHistory(era, amtStr);
-            await this.notifier.payoutReceived(this.addr, era, amtStr, this.token);
+            let era = payoutEra;
+            if (era == null) {
+              era = (await this._activeEra()) - 1;
+              console.warn(`[Payouts] Rewarded without PayoutStarted — assuming era ${era}`);
+            }
+            const amtStr  = toToken(amount.toString(), this.decimals);
+            const eraTotal = await this._recordPayout(era, amtStr);
+            await this.notifier.payoutReceived(this.addr, era, amtStr, eraTotal, this.token);
           }
         }
 
@@ -174,19 +220,19 @@ class ChainWatcher {
         }
 
         if (section === 'session' && method === 'NewSession') {
-          const [sessionIndex] = data;
-          await this._handleNewSession(sessionIndex.toNumber());
+          await this._handleNewSession();
         }
+      } catch (e) {
+        console.error(`[Events] ${section}.${method} error:`, e.message);
       }
-    });
-    this._unsubs.push(unsub);
+    }
   }
 
   // ── Active / Inactive ─────────────────────────────────────────────────────────
 
   async _checkActiveSet(blockNum) {
     if (blockNum % 100 !== 0 && blockNum % 100 !== 1) return;
-    const era      = await this._currentEra();
+    const era      = await this._activeEra();
     const exposure = await this._getExposure(era);
     const isActive = exposure ? !exposure.total.isZero() : false;
 
@@ -221,154 +267,151 @@ class ChainWatcher {
     }
 
     const lastPending = await this.state.get('pending_noms_last_check', 0);
-    if (now - lastPending >= this.pendingCheckMs) {
+    if (now - lastPending >= this.pendingCheckMs && !this.poolLock.busy) {
       await this.state.set('pending_noms_last_check', now);
-      await this._checkPendingNominators();
+      // Detached: the scan takes ~1 min and must not hold up block handling
+      this.scanPool().catch(e => console.error('[Nominators] Scan error:', e.message));
     }
   }
 
   /** Updates the active nominator display cache from erasStakers. No alerts fired here. */
   async _checkActiveNominators() {
-    const era = await this._currentEra();
-    let exposure;
-    try { exposure = await this._getExposure(era); }
-    catch (e) { console.error('[Nominators/Active] Error:', e.message); return; }
+    const era      = await this._activeEra();
+    const exposure = await this._getExposure(era);
     if (!exposure) return;
 
     const currentNoms = {};
     for (const { who, value } of exposure.others) currentNoms[who.toString()] = value.toString();
     await this.state.set('nominators_active', currentNoms);
-    await this.state.set('nominators', currentNoms);
+  }
+
+  /** ledger.active for a stash (or its controller) as a token string; throws on RPC error. */
+  async _ledgerActive(addr) {
+    let ledger = await this.api.query.staking.ledger(addr);
+    if (ledger.isNone) {
+      const bonded = await this.api.query.staking.bonded(addr);
+      if (bonded.isSome) ledger = await this.api.query.staking.ledger(bonded.unwrap());
+    }
+    return ledger.isSome ? toToken(ledger.unwrap().active.toString(), this.decimals) : '0';
+  }
+
+  /** Own self-bond as a float, 0 if it can't be read. */
+  async _ownStake() {
+    try { return parseFloat(await this._ledgerActive(this.addr)); }
+    catch (e) { console.error('[Stake] Own ledger error:', e.message); return 0; }
   }
 
   /**
-   * Full pool diff — scans staking.nominators for all addresses targeting this validator,
-   * reads ledger.active (full bonded amount) for each, then diffs against the saved pool.
-   * Alerts are sent only when change exceeds minStakeChange.
-   * Own stake (validator's self-bond) is included in total calculations.
+   * Full pool scan — finds every nominator targeting this validator, reads
+   * ledger.active for each and diffs against the alert baseline.
+   * Throws BusyError if a scan is already running; onStart is called once the lock is held.
+   *
+   * @returns {{ activeNoms, pendingNoms, grandTotal, failed }}
    */
-  async _checkPendingNominators() {
+  scanPool(onStart) {
+    return this.poolLock.run(async () => {
+      if (onStart) await onStart();
+      return this._scanPool();
+    });
+  }
+
+  async _scanPool() {
     console.log('[Nominators] Running full pool scan…');
 
-    // Own stake — validator's self-bond, always included in total
-    let ownStake = 0;
-    try {
-      let ledger = await this.api.query.staking.ledger(this.addr);
-      if (ledger.isNone) {
-        const bonded = await this.api.query.staking.bonded(this.addr);
-        if (bonded.isSome) ledger = await this.api.query.staking.ledger(bonded.unwrap());
-      }
-      if (ledger.isSome) ownStake = toFloat(ledger.unwrap().active.toString(), this.decimals);
-    } catch (_) {}
+    const era       = await this._activeEra();
+    const exposure  = await this._getExposure(era);
+    const activeSet = new Set(exposure ? exposure.others.map(n => n.who.toString()) : []);
+    const ownStake  = await this._ownStake();
 
-    // Scan all nominators
-    let allNomEntries;
-    try { allNomEntries = await this.api.query.staking.nominators.entries(); }
-    catch (e) { console.error('[Nominators] Scan error:', e.message); return; }
-
+    // If this throws, the scan is aborted and saved state stays untouched —
+    // writing an empty pool would make the next scan report everyone as "new".
+    const allNomEntries = await this.api.query.staking.nominators.entries();
     const nomAddrs = [];
     for (const [key, nomOpt] of allNomEntries) {
       if (nomOpt.isNone) continue;
-      const targets = nomOpt.unwrap().targets.map(t => t.toString());
-      if (targets.includes(this.addr)) nomAddrs.push(key.args[0].toString());
-    }
-
-    // Fetch ledger.active for every nominator in batches of 20
-    const BATCH = 20;
-    const currentPool = {};  // addr -> token string (ledger.active)
-    for (let i = 0; i < nomAddrs.length; i += BATCH) {
-      const batch   = nomAddrs.slice(i, i + BATCH);
-      const results = await Promise.all(batch.map(async (addr) => {
-        try {
-          let nl = await this.api.query.staking.ledger(addr);
-          if (nl.isNone) {
-            const nb = await this.api.query.staking.bonded(addr);
-            if (nb.isSome) nl = await this.api.query.staking.ledger(nb.unwrap());
-          }
-          return { addr, amount: nl.isSome ? toToken(nl.unwrap().active.toString(), this.decimals) : '0' };
-        } catch (_) { return { addr, amount: '0' }; }
-      }));
-      for (const { addr, amount } of results) currentPool[addr] = amount;
-    }
-
-    await this.state.set('nominators_pending', currentPool);
-
-    // Bootstrap — save baseline silently on first run
-    const bootstrapped = await this.state.get('pool_bootstrapped', false);
-    if (!bootstrapped) {
-      await this.state.set('nominators_pool', currentPool);
-      await this.state.set('pool_bootstrapped', true);
-      console.log(`[Nominators] Bootstrap: ${nomAddrs.length} nominators, own stake: ${ownStake.toFixed(4)} ${this.token}`);
-      return;
+      if (nomOpt.unwrap().targets.some(t => t.toString() === this.addr)) nomAddrs.push(key.args[0].toString());
     }
 
     const prevPool = await this.state.get('nominators_pool', {}) || {};
 
-    // Calculate totals including own stake
-    const calcTotal = (pool) =>
-      ownStake + Object.values(pool).reduce((s, v) => s + toFloat(v, this.decimals), 0);
-
-    const prevTotal = calcTotal(prevPool);
-
-    const allAddrs = new Set([...Object.keys(currentPool), ...Object.keys(prevPool)]);
-    let changed = false;
-
-    for (const nomAddr of allAddrs) {
-      const curr = currentPool[nomAddr];
-      const prev = prevPool[nomAddr];
-
-      if (curr && !prev) {
-        const stake = toFloat(curr, this.decimals);
-        if (stake < this.minStakeChange) continue;
-        changed = true;
-        const newTotal = calcTotal(currentPool);
-        const delta    = newTotal - prevTotal;
-        await this.notifier.nominatorJoined(nomAddr, stake.toFixed(4), newTotal.toFixed(4), delta.toFixed(4), this.token);
-
-      } else if (!curr && prev) {
-        const stake = toFloat(prev, this.decimals);
-        if (stake < this.minStakeChange) continue;
-        changed = true;
-        const newTotal = calcTotal(currentPool);
-        const delta    = newTotal - prevTotal;
-        await this.notifier.nominatorLeft(nomAddr, stake.toFixed(4), newTotal.toFixed(4), delta.toFixed(4), this.token);
-
-      } else if (curr && prev) {
-        const oldAmt = toFloat(prev, this.decimals);
-        const newAmt = toFloat(curr, this.decimals);
-        const diff   = Math.abs(newAmt - oldAmt);
-        if (diff < this.minStakeChange) continue;
-        changed = true;
-        const newTotal = calcTotal(currentPool);
-        const delta    = newTotal - prevTotal;
-        await this.notifier.nominatorStakeChanged(nomAddr, oldAmt.toFixed(4), newAmt.toFixed(4), newTotal.toFixed(4), delta.toFixed(4), this.token);
-      }
+    // Fetch ledger.active in batches. A failed query must not be read as "0" —
+    // that produced false "stake dropped to 0" alerts. Carry the previous value instead.
+    const BATCH = 20;
+    const currentPool = {};
+    const failed = [];
+    for (let i = 0; i < nomAddrs.length; i += BATCH) {
+      const batch = nomAddrs.slice(i, i + BATCH);
+      await Promise.all(batch.map(async (addr) => {
+        try { currentPool[addr] = await this._ledgerActive(addr); }
+        catch (_) { failed.push(addr); }
+      }));
+    }
+    const maxFailed = Math.max(5, Math.ceil(nomAddrs.length * 0.1));
+    if (failed.length > maxFailed) {
+      throw new Error(`Nominator scan aborted: ${failed.length}/${nomAddrs.length} ledger queries failed`);
+    }
+    if (failed.length > 0) console.warn(`[Nominators] ${failed.length} ledger queries failed — keeping previous values`);
+    for (const addr of failed) {
+      if (prevPool[addr] !== undefined) currentPool[addr] = prevPool[addr];
     }
 
-    if (changed) await this.state.set('nominators_pool', currentPool);
-    const total = calcTotal(currentPool);
-    console.log(`[Nominators] Done: ${nomAddrs.length} nominators, total bonded: ${total.toFixed(4)} ${this.token}`);
-  }
+    const sum       = (pool) => Object.values(pool).reduce((s, v) => s + toFloat(v, this.decimals), 0);
+    const poolTotal = (ownStake + sum(currentPool)).toFixed(4);
 
-  // ── Oversubscribed ────────────────────────────────────────────────────────────
+    const waiting = {};
+    for (const [addr, amt] of Object.entries(currentPool)) if (!activeSet.has(addr)) waiting[addr] = amt;
+    await this.state.set('nominators_current', currentPool);
+    await this.state.set('nominators_pending', waiting);
 
-  async _checkOversubscribed() {
-    const now      = Date.now();
-    const lastCheck = await this.state.get('oversub_last_check', 0);
-    if (now - lastCheck < 30 * 60_000) return;
-    await this.state.set('oversub_last_check', now);
+    const bootstrapped = await this.state.get('pool_bootstrapped', false);
+    if (!bootstrapped) {
+      // First run — save baseline silently
+      await this.state.set('nominators_pool', currentPool);
+      await this.state.set('pool_bootstrapped', true);
+      console.log(`[Nominators] Bootstrap: ${nomAddrs.length} nominators, own stake: ${ownStake.toFixed(4)} ${this.token}`);
+    } else {
+      // Alert baseline is updated per nominator only when an alert fires, so
+      // small changes accumulate until they cross minStakeChange.
+      const baseline = { ...prevPool };
+      const alerts   = [];
+      for (const addr of new Set([...Object.keys(currentPool), ...Object.keys(prevPool)])) {
+        const curr = currentPool[addr];
+        const prev = prevPool[addr];
 
-    const era      = await this._currentEra();
-    const exposure = await this._getExposure(era);
-    if (!exposure) return;
+        if (curr !== undefined && prev === undefined) {
+          const stake = toFloat(curr, this.decimals);
+          if (stake < this.minStakeChange) continue;   // tracked once it grows past the threshold
+          baseline[addr] = curr;
+          alerts.push(() => this.notifier.nominatorJoined(addr, stake.toFixed(4), poolTotal, this.token));
 
-    const count  = exposure.others.length;
-    const wasOver = await this.state.get('is_oversubscribed', false);
-    const isOver  = count > this.oversubLimit;
+        } else if (curr === undefined && prev !== undefined) {
+          delete baseline[addr];
+          const stake = toFloat(prev, this.decimals);
+          if (stake < this.minStakeChange) continue;
+          alerts.push(() => this.notifier.nominatorLeft(addr, stake.toFixed(4), poolTotal, this.token));
 
-    if (isOver && !wasOver)  await this.notifier.oversubscribed(this.addr, count, this.oversubLimit);
-    if (!isOver && wasOver)  await this.notifier.oversubscribedResolved(this.addr, count, this.oversubLimit);
-    await this.state.set('is_oversubscribed', isOver);
+        } else {
+          const oldAmt = toFloat(prev, this.decimals);
+          const newAmt = toFloat(curr, this.decimals);
+          if (Math.abs(newAmt - oldAmt) < this.minStakeChange) continue;
+          baseline[addr] = curr;
+          alerts.push(() => this.notifier.nominatorStakeChanged(addr, oldAmt.toFixed(4), newAmt.toFixed(4), poolTotal, this.token));
+        }
+      }
+      // Persist before sending, so a crash mid-way can't re-send the same alerts
+      await this.state.set('nominators_pool', baseline);
+      for (const send of alerts) await send();
+    }
+
+    const toList = (addrs) => addrs.map(addr => ({ addr, amount: currentPool[addr] }));
+    const activeAddrs = Object.keys(currentPool).filter(a => activeSet.has(a));
+    console.log(`[Nominators] Done: ${nomAddrs.length} nominators (${activeAddrs.length} active), total bonded: ${poolTotal} ${this.token}`);
+    return {
+      activeNoms:  toList(activeAddrs),
+      pendingNoms: toList(Object.keys(waiting)),
+      grandTotal:  poolTotal,
+      failed:      failed.length,
+    };
   }
 
   // ── Session keys ──────────────────────────────────────────────────────────────
@@ -378,35 +421,28 @@ class ChainWatcher {
     const lastCheck = await this.state.get('keys_last_check', 0);
     if (now - lastCheck < this.keyCheckMs) return;
     await this.state.set('keys_last_check', now);
-    if (!this.rcApi) return;
-    try {
-      const newKeys = await this._fetchSessionKeys();
-      if (!newKeys) return;
-      const prevKeys = await this.state.get('session_keys', null);
-      if (prevKeys === null) { await this.state.set('session_keys', newKeys); return; }
-      if (newKeys !== prevKeys) {
-        await this.notifier.sessionKeysChanged(this.addr, prevKeys, newKeys);
-        await this.state.set('session_keys', newKeys);
-      }
-    } catch (e) { console.error('[Keys] Error:', e.message); }
+    await this._refreshSessionKeys();
   }
 
-  async _handleNewSession(sessionIndex) {
+  async _handleNewSession() {
     const now      = Date.now();
     const lastCheck = await this.state.get('keys_last_check', 0);
     if (now - lastCheck < 60 * 60_000) return;
     await this.state.set('keys_last_check', now);
-    if (!this.rcApi) return;
-    try {
-      const newKeys  = await this._fetchSessionKeys();
-      if (!newKeys) return;
-      const prevKeys = await this.state.get('session_keys', null);
-      if (prevKeys === null) { await this.state.set('session_keys', newKeys); return; }
-      if (newKeys !== prevKeys) {
-        await this.notifier.sessionKeysChanged(this.addr, prevKeys, newKeys);
-        await this.state.set('session_keys', newKeys);
-      }
-    } catch (e) { console.error('[Keys] NewSession error:', e.message); }
+    await this._refreshSessionKeys();
+  }
+
+  /** Fetch keys from the Relay Chain, alert on change. Returns the keys (or null). */
+  async _refreshSessionKeys() {
+    if (!this._rcAvailable()) return null;
+    const newKeys = await this._fetchSessionKeys();
+    if (!newKeys) return null;
+    const prevKeys = await this.state.get('session_keys', null);
+    if (newKeys !== prevKeys) {
+      await this.state.set('session_keys', newKeys);
+      if (prevKeys !== null) await this.notifier.sessionKeysChanged(this.addr, prevKeys, newKeys);
+    }
+    return newKeys;
   }
 
   async _fetchSessionKeys() {
@@ -418,51 +454,109 @@ class ChainWatcher {
   }
 
   // ── Payout history ────────────────────────────────────────────────────────────
+  //
+  // History holds the validator's own reward per era (commission + own-stake
+  // share) — the same amount Rewarded reports. Paged payouts emit one
+  // Rewarded per page, so amounts for the same era are summed.
 
-  async _savePayoutHistory(era, amount) {
+  /** Add a payout to history, returns the era total so far. */
+  async _recordPayout(era, amount) {
     const history = await this.state.get('payout_history', []) || [];
-    history.unshift({ era, amount, ts: Date.now() });
-    if (history.length > 10) history.splice(10);
+    let entry = history.find(h => h.era === era);
+    if (entry) {
+      entry.amount = (parseFloat(entry.amount) + parseFloat(amount)).toFixed(4);
+      entry.ts     = Date.now();
+    } else {
+      entry = { era, amount, ts: Date.now() };
+      history.push(entry);
+    }
+    history.sort((a, b) => b.era - a.era);
+    history.splice(10);
     await this.state.set('payout_history', history);
+    await this.state.set('last_payout_era', history[0].era);
+    return entry.amount;
   }
 
+  /**
+   * Rebuild history from chain for the last 10 fully-claimed eras.
+   * v2: earlier versions stored the validator's whole era share (incl. nominators)
+   * and labelled live payouts with currentEra — both wrong, so history is rebuilt once.
+   */
   async _loadRecentPayouts() {
-    if (await this.state.get('payouts_bootstrapped', false)) return;
+    if (await this.state.get('payouts_bootstrapped_v2', false)) return;
     try {
-      const currentEra = await this._currentEra();
-      const history    = [];
-      for (let e = currentEra - 1; e >= Math.max(0, currentEra - 5); e--) {
-        const reward = await this.api.query.staking.erasValidatorReward(e).catch(() => null);
-        if (!reward || !reward.isSome) continue;
-        const pts   = await this.api.query.staking.erasRewardPoints(e).catch(() => null);
-        if (!pts) continue;
-        const myPts = pts.individual.get ? pts.individual.get(this.addr) : null;
-        if (!myPts || myPts.toNumber() === 0) continue;
-        const totalPts = pts.total.toNumber();
-        const totalRew = BigInt(reward.unwrap().toString());
-        const myRew    = totalPts > 0 ? (totalRew * BigInt(myPts.toNumber())) / BigInt(totalPts) : 0n;
-        history.push({ era: e, amount: toToken(myRew.toString(), this.decimals), ts: null });
+      const activeEra = await this._activeEra();
+      const old       = await this.state.get('payout_history', []) || [];
+      const history   = [];
+      for (let e = activeEra - 1; e >= Math.max(0, activeEra - 10); e--) {
+        const amount = await this._eraValidatorPayout(e);
+        if (amount == null) continue;
+        const amtStr = toToken(amount.toString(), this.decimals);
+        // Old entries had the right amount under the wrong era — reuse their timestamp
+        const match  = old.find(h => h.amount === amtStr && h.ts);
+        history.push({ era: e, amount: amtStr, ts: match ? match.ts : null });
       }
-      if (history.length > 0) {
+      if (history.length === 0) {
+        console.warn('[Payouts] Nothing found on chain — keeping existing history');
+      } else {
         await this.state.set('payout_history', history);
         await this.state.set('last_payout_era', history[0].era);
-        console.log(`[Payouts] Loaded ${history.length} historical eras`);
+        console.log(`[Payouts] Rebuilt history: ${history.length} eras`);
       }
+      await this.state.set('payouts_bootstrapped_v2', true);
     } catch (e) { console.error('[Payouts] History load error:', e.message); }
-    await this.state.set('payouts_bootstrapped', true);
+  }
+
+  /**
+   * Validator's own payout for a fully claimed era, in planck:
+   *   payout     = eraReward × myPoints / totalPoints
+   *   commission = payout × commission%
+   *   ownShare   = (payout − commission) × own / total
+   * Returns null if the era is not (fully) claimed or we earned nothing.
+   */
+  async _eraValidatorPayout(era) {
+    const q = this.api.query.staking;
+    const [reward, pts, ovOpt, claimed, prefs] = await Promise.all([
+      q.erasValidatorReward(era),
+      q.erasRewardPoints(era),
+      q.erasStakersOverview(era, this.addr),
+      q.claimedRewards(era, this.addr),
+      q.erasValidatorPrefs(era, this.addr),
+    ]);
+    if (reward.isNone || ovOpt.isNone) return null;
+    const ov = ovOpt.unwrap();
+    if (claimed.length < ov.pageCount.toNumber()) return null;   // not (fully) paid out
+
+    // individual is a BTreeMap keyed by AccountId objects — Map.get(string) misses
+    let myPts = 0n;
+    for (const [who, p] of pts.individual) {
+      if (who.toString() === this.addr) { myPts = BigInt(p.toString()); break; }
+    }
+    const totalPts = BigInt(pts.total.toString());
+    if (myPts === 0n || totalPts === 0n) return null;
+
+    const payout     = BigInt(reward.unwrap().toString()) * myPts / totalPts;
+    const commission = payout * BigInt(prefs.commission.unwrap().toString()) / PERBILL;
+    const total      = BigInt(ov.total.toString());
+    const own        = BigInt(ov.own.toString());
+    const ownShare   = total > 0n ? (payout - commission) * own / total : 0n;
+    return commission + ownShare;
   }
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────────
 
   async _startHeartbeat() {
     this._stopHeartbeat();
-    this._heartbeatTimer = setInterval(async () => {
+    this._heartbeatTimer = setInterval(() => {
       const elapsed = Date.now() - this._lastBlock;
       if (elapsed > this.heartbeatMs * 2) {
         this._offlineStrikes++;
         this._onlineStrikes = 0;
-        if (this._offlineStrikes >= this.offlineThreshold) await this._handleOffline();
-        else console.log(`[Heartbeat] No block for ${Math.round(elapsed / 1000)}s (strike ${this._offlineStrikes}/${this.offlineThreshold})`);
+        if (this._offlineStrikes >= this.offlineThreshold) {
+          this._handleOffline(Math.round(elapsed / 1000)).catch(e => console.error('[Heartbeat] Error:', e.message));
+        } else {
+          console.log(`[Heartbeat] No block for ${Math.round(elapsed / 1000)}s (strike ${this._offlineStrikes}/${this.offlineThreshold})`);
+        }
       } else {
         this._offlineStrikes = 0;
       }
@@ -481,50 +575,65 @@ class ChainWatcher {
       return;
     }
     console.log(`[NodeHealth] Polling ${this.nodeRpc} every ${this.nodeHealthMs / 1000}s`);
+    let running = false;
     const check = async () => {
-      try {
-        const res  = await fetch(this.nodeRpc, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'system_health', params: [] }),
-          signal: AbortSignal.timeout(5_000),
-        });
-        const { result } = await res.json();
-        const healthy = result && result.peers > 0 && !result.shouldHavePeers === false;
-        // peers=0 counts as offline; isSyncing does NOT
-        const isDown = !result || result.peers === 0;
-        if (isDown) {
-          this._nodeOnStrikes  = 0;
-          this._nodeOffStrikes++;
-          if (this._nodeOffStrikes >= this.offlineThreshold && this._nodeOnline !== false) {
-            this._nodeOnline = false;
-            console.warn('[NodeHealth] Node OFFLINE (peers=0 or unreachable)');
-            await this.notifier.nodeOffline?.();
-          }
-        } else {
-          this._nodeOffStrikes = 0;
-          this._nodeOnStrikes++;
-          if (this._nodeOnStrikes >= this.onlineThreshold && this._nodeOnline !== true) {
-            const wasOffline = this._nodeOnline === false;
-            this._nodeOnline = true;
-            console.log(`[NodeHealth] Node online — peers: ${result.peers}`);
-            if (wasOffline) await this.notifier.nodeOnline?.();
-          }
-          this._nodeOnline = true;
-        }
-        this._nodeLastPeers = result?.peers ?? null;
-      } catch (_) {
-        this._nodeOnStrikes  = 0;
-        this._nodeOffStrikes++;
-        if (this._nodeOffStrikes >= this.offlineThreshold && this._nodeOnline !== false) {
-          this._nodeOnline = false;
-          console.warn('[NodeHealth] Node unreachable');
-          await this.notifier.nodeOffline?.();
-        }
-      }
+      if (running) return;
+      running = true;
+      try { await this._checkNodeHealth(); }
+      catch (e) { console.error('[NodeHealth] Error:', e.message); }
+      finally { running = false; }
     };
     check();
     this._nodeHealthTimer = setInterval(check, this.nodeHealthMs);
+  }
+
+  /**
+   * One system_health poll. The node state only changes after N consecutive
+   * observations of the new state (separate thresholds for offline/syncing/online).
+   */
+  async _checkNodeHealth() {
+    let observed, reason = null, peers = null;
+    try {
+      const res = await fetch(this.nodeRpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'system_health', params: [] }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { result, error } = await res.json();
+      if (!result) throw new Error(error?.message || 'empty system_health response');
+      peers = result.peers;
+      if (result.peers === 0)    { observed = 'offline'; reason = 'no peers'; }
+      else if (result.isSyncing) { observed = 'syncing'; }
+      else                       { observed = 'online'; }
+    } catch (e) {
+      observed = 'offline';
+      reason   = `unreachable (${e.message})`;
+    }
+    this._nodeLastPeers = peers;
+
+    if (observed === this._nodeState) { this._nodeCandidate = null; this._nodeStrikes = 0; return; }
+    if (observed !== this._nodeCandidate) { this._nodeCandidate = observed; this._nodeStrikes = 0; }
+    this._nodeStrikes++;
+
+    const need = observed === 'offline' ? this.nodeOfflineThreshold
+               : observed === 'syncing' ? this.nodeSyncThreshold
+               : this.nodeOnlineThreshold;
+    if (this._nodeStrikes < need) {
+      console.log(`[NodeHealth] ${observed}${reason ? ` (${reason})` : ''} — ${this._nodeStrikes}/${need}`);
+      return;
+    }
+
+    const prev = this._nodeState;
+    this._nodeState     = observed;
+    this._nodeCandidate = null;
+    this._nodeStrikes   = 0;
+    console.warn(`[NodeHealth] ${prev ?? 'unknown'} → ${observed}${reason ? ` (${reason})` : ''}`);
+
+    if (observed === 'offline')      await this.notifier.nodeOffline(this.nodeRpc, reason);
+    else if (observed === 'syncing') await this.notifier.nodeSyncing(this.nodeRpc, peers);
+    else if (prev !== null)          await this.notifier.nodeOnline(this.nodeRpc, peers);
   }
 
   async _notifyOnline() {
@@ -536,16 +645,16 @@ class ChainWatcher {
     }
     this._onlineStrikes  = 0;
     this._offlineStrikes = 0;
-    if (this._wasOnline === false) await this.notifier.reconnected(this.rpc);
-    await this.notifier.validatorOnline(this.addr, this.network);
-    this._wasOnline = true;
+    const recovered = this._wasOnline === false;
+    this._wasOnline = true;   // set before awaiting so concurrent blocks don't double-send
+    console.log(`[Heartbeat] Chain ${recovered ? 'connection restored' : 'online'}`);
+    if (recovered) await this.notifier.chainOnline(this.rpc, this.network, true);
   }
 
-  async _handleOffline() {
-    if (this._wasOnline !== false) {
-      this._wasOnline = false;
-      await this.notifier.validatorOffline(this.addr, this.network);
-    }
+  async _handleOffline(silentSec) {
+    if (this._wasOnline === false) return;
+    this._wasOnline = false;
+    await this.notifier.chainOffline(this.rpc, this.network, silentSec);
   }
 
   // ── /status ───────────────────────────────────────────────────────────────────
@@ -555,7 +664,7 @@ class ChainWatcher {
     const Notifier = require('./notifier');
 
     const [era, header] = await Promise.all([
-      this._currentEra(),
+      this._activeEra(),
       this.api.rpc.chain.getHeader(),
     ]);
     const blockNumber = header.number.toNumber();
@@ -565,19 +674,9 @@ class ChainWatcher {
     const isActive = exposure ? !exposure.total.isZero() : false;
 
     // Own bonded stake
-    let ownStake    = '0';
-    let ownStakeNum = 0;
-    try {
-      let ledger = await this.api.query.staking.ledger(this.addr);
-      if (ledger.isNone) {
-        const bonded = await this.api.query.staking.bonded(this.addr);
-        if (bonded.isSome) ledger = await this.api.query.staking.ledger(bonded.unwrap());
-      }
-      if (ledger.isSome) {
-        ownStake    = toToken(ledger.unwrap().active.toString(), this.decimals);
-        ownStakeNum = parseFloat(ownStake);
-      }
-    } catch (_) {}
+    let ownStake = '0';
+    try { ownStake = await this._ledgerActive(this.addr); } catch (_) {}
+    const ownStakeNum = parseFloat(ownStake);
 
     // Active nominators from erasStakers (for display/top list only)
     let activeNoms = [];
@@ -591,37 +690,26 @@ class ChainWatcher {
 
     const topNominators  = [...activeNoms].sort((a, b) => parseFloat(b.amount) - parseFloat(a.amount)).slice(0, 5);
     const nominatorCount = activeNoms.length;
-    const pendingCount   = Object.keys(await this.state.get('nominators_pending', {}) || {}).length;
 
-    // Full pool total (own stake + all nominators' ledger.active)
-    const poolMap    = await this.state.get('nominators_pool', {}) || {};
-    const activeMap  = await this.state.get('nominators_active', {}) || {};
-    const pendingMap = await this.state.get('nominators_pending', {}) || {};
-    const mergedMap  = Object.keys(poolMap).length > 0 ? poolMap : { ...activeMap, ...pendingMap };
-    const allNomCount = Object.keys(mergedMap).length;
-
+    // Full pool (own stake + all nominators' ledger.active) from the last full scan
+    const current  = await this.state.get('nominators_current', null);
+    const poolMap  = current || await this.state.get('nominators_pool', {}) || {};
+    const allNomCount  = Object.keys(poolMap).length;
+    const pendingCount = current ? Object.keys(await this.state.get('nominators_pending', {}) || {}).length : null;
     const poolTotal = allNomCount > 0
-      ? (ownStakeNum + Object.values(mergedMap).reduce((s, v) => s + toFloat(v, this.decimals), 0)).toFixed(4)
+      ? (ownStakeNum + Object.values(poolMap).reduce((s, v) => s + toFloat(v, this.decimals), 0)).toFixed(4)
       : null;
 
     // Session keys
     let sessionKeys = null, sessionKeysNote = null;
-    try {
-      if (!this.rcApi) {
-        sessionKeysNote = 'no Relay Chain connection';
-      } else {
-        sessionKeys = await this._fetchSessionKeys();
-        if (sessionKeys) {
-          const prev = await this.state.get('session_keys', null);
-          if (prev !== sessionKeys) {
-            if (prev) await this.notifier.sessionKeysChanged(this.addr, prev, sessionKeys);
-            await this.state.set('session_keys', sessionKeys);
-          }
-        } else {
-          sessionKeysNote = 'not set';
-        }
-      }
-    } catch (e) { console.error('[Status] Session keys error:', e.message); }
+    if (!this._rcAvailable()) {
+      sessionKeysNote = 'no Relay Chain connection';
+    } else {
+      try {
+        sessionKeys = await this._refreshSessionKeys();
+        if (!sessionKeys) sessionKeysNote = 'not set';
+      } catch (e) { console.error('[Status] Session keys error:', e.message); }
+    }
 
     const payoutHistory = await this.state.get('payout_history', []) || [];
     const lastPayoutEra = await this.state.get('last_payout_era', null);
@@ -631,8 +719,6 @@ class ChainWatcher {
     const uptimeMins  = Math.floor((uptimeMs % 3_600_000) / 60_000);
     const uptimeLabel = uptimeHours > 0 ? `${uptimeHours}h ${uptimeMins}m` : `${uptimeMins}m`;
 
-    const isOver = exposure ? exposure.others.length > this.oversubLimit : false;
-
     return Notifier.formatStatus({
       network: this.network, address: this.addr,
       online:  this._wasOnline !== false, active: isActive,
@@ -641,11 +727,11 @@ class ChainWatcher {
       nominatorCount, allNomCount, pendingCount,
       topNominators, sessionKeys, sessionKeysNote,
       lastPayoutEra, payoutHistory,
-      uptimeLabel, isOversubscribed: isOver,
-      oversubLimit: this.oversubLimit,
+      uptimeLabel,
+      exposurePages: exposure ? exposure.pageCount : 0,
       nodeRpcConfigured: !!this.nodeRpc,
-      nodeOnline: this._nodeOnline,
-      nodePeers:  this._nodeLastPeers ?? null,
+      nodeState: this._nodeState,
+      nodePeers: this._nodeLastPeers,
     });
   }
 
@@ -673,6 +759,7 @@ class ChainWatcher {
         total:  { isZero: () => totalBn === 0n, toString: () => totalBn.toString() },
         own:    { isZero: () => ownBn === 0n,   toString: () => ownBn.toString() },
         others,
+        pageCount,
       };
     }
     if (this.api.query.staking.erasStakers) {
@@ -684,12 +771,16 @@ class ChainWatcher {
         total:  { isZero: () => totalBn === 0n, toString: () => totalBn.toString() },
         own:    { isZero: () => ownBn === 0n,   toString: () => ownBn.toString() },
         others,
+        pageCount: 1,
       };
     }
     return null;
   }
 
-  async _currentEra() {
+  /** Era currently being validated. currentEra is the *planned* era and runs ahead after elections. */
+  async _activeEra() {
+    const ae = await this.api.query.staking.activeEra();
+    if (ae.isSome) return ae.unwrap().index.toNumber();
     const era = await this.api.query.staking.currentEra();
     return era.isSome ? era.unwrap().toNumber() : 0;
   }

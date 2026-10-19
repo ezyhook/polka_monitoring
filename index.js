@@ -4,9 +4,14 @@ require('dotenv').config();
 
 const StateManager                    = require('./src/state');
 const Notifier                        = require('./src/notifier');
-const { ChainWatcher, toToken, toFloat } = require('./src/watcher');
+const { escapeHtml }                  = require('./src/notifier');
+const { ChainWatcher }                = require('./src/watcher');
 const { clearCache, refreshLedgerCache } = require('./src/phragmen');
 const { runPhragmenInChild }          = require('./src/phragmen-runner');
+const { Lock }                        = require('./src/lock');
+
+// One Phragmén child at a time (each gets a 1.5 GB heap)
+const rankLock = new Lock('Phragmén analysis');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,84 +34,19 @@ const CONFIG = {
   nomCheckMs:           parseInt(process.env.NOM_CHECK_INTERVAL       || '300000',   10),
   keyCheckMs:           parseInt(process.env.KEY_CHECK_INTERVAL       || '300000',   10),
   pendingCheckInterval: parseInt(process.env.PENDING_CHECK_INTERVAL   || '14400000', 10),
-  oversubLimit:         parseInt(process.env.OVERSUB_LIMIT            || '512',      10),
   offlineThreshold:     parseInt(process.env.OFFLINE_THRESHOLD        || '3',        10),
   onlineThreshold:      parseInt(process.env.ONLINE_THRESHOLD         || '2',        10),
   minStakeChange:       parseFloat(process.env.MIN_STAKE_CHANGE       || '100'),
   nodeRpcEndpoint:      process.env.NODE_RPC_ENDPOINT                 || null,
   nodeHealthInterval:   parseInt(process.env.NODE_HEALTH_INTERVAL     || '60000',    10),
+  // Node health thresholds — fall back to the heartbeat ones if not set
+  nodeOfflineThreshold: parseInt(process.env.NODE_OFFLINE_THRESHOLD || process.env.OFFLINE_THRESHOLD || '3', 10),
+  nodeOnlineThreshold:  parseInt(process.env.NODE_ONLINE_THRESHOLD  || process.env.ONLINE_THRESHOLD  || '2', 10),
+  nodeSyncThreshold:    parseInt(process.env.NODE_SYNC_THRESHOLD    || '5', 10),
   // Phragmen schedule: UTC times for 4 daily runs
   // 9:00, 16:00, 22:00 UTC+3 = 6:00, 13:00, 19:00 UTC  + one more at 01:00 UTC
   rankScheduleUTC: (process.env.RANK_SCHEDULE_UTC || '1,6,13,19').split(',').map(h => parseInt(h.trim(), 10)),
 };
-
-// ── Shared nominator scan ─────────────────────────────────────────────────────
-
-async function scanNominators(watcher, state) {
-  const era      = await watcher._currentEra();
-  const exposure = await watcher._getExposure(era);
-  const eraActiveSet = new Set(
-    exposure ? exposure.others.map(n => n.who.toString()) : []
-  );
-
-  let allNomAddrs = [];
-  try {
-    const entries = await watcher.api.query.staking.nominators.entries();
-    for (const [key, nomOpt] of entries) {
-      if (nomOpt.isNone) continue;
-      const targets = nomOpt.unwrap().targets.map(t => t.toString());
-      if (!targets.includes(CONFIG.validatorAddress)) continue;
-      allNomAddrs.push(key.args[0].toString());
-    }
-  } catch (e) { console.error('[scanNominators] Error:', e.message); }
-
-  const BATCH = 30;
-  const allNoms = [];
-  for (let i = 0; i < allNomAddrs.length; i += BATCH) {
-    const batch   = allNomAddrs.slice(i, i + BATCH);
-    const results = await Promise.all(batch.map(async (addr) => {
-      try {
-        let nl = await watcher.api.query.staking.ledger(addr);
-        if (nl.isNone) {
-          const nb = await watcher.api.query.staking.bonded(addr);
-          if (nb.isSome) nl = await watcher.api.query.staking.ledger(nb.unwrap());
-        }
-        return { addr, amount: nl.isSome ? toToken(nl.unwrap().active.toString(), watcher.decimals) : '0', active: eraActiveSet.has(addr) };
-      } catch (_) { return { addr, amount: '0', active: eraActiveSet.has(addr) }; }
-    }));
-    allNoms.push(...results);
-  }
-
-  const poolMap = {}, activeMap = {}, pendingMap = {};
-  for (const n of allNoms) {
-    poolMap[n.addr]    = n.amount;
-    if (n.active) activeMap[n.addr] = n.amount;
-    else          pendingMap[n.addr] = n.amount;
-  }
-
-  await state.set('nominators_pool', poolMap);
-  await state.set('pool_bootstrapped', true);
-  await state.set('nominators_active', activeMap);
-  await state.set('nominators', activeMap);
-  await state.set('active_bootstrapped', true);
-  await state.set('nominators_pending', pendingMap);
-  await state.set('nominators_pending_prev', pendingMap);
-  await state.set('pending_bootstrapped', true);
-
-  let ownStakeNum = 0;
-  try {
-    let ledger = await watcher.api.query.staking.ledger(watcher.addr);
-    if (ledger.isNone) {
-      const bonded = await watcher.api.query.staking.bonded(watcher.addr);
-      if (bonded.isSome) ledger = await watcher.api.query.staking.ledger(bonded.unwrap());
-    }
-    if (ledger.isSome) ownStakeNum = parseFloat(toToken(ledger.unwrap().active.toString(), watcher.decimals));
-  } catch (_) {}
-
-  const grandTotal = (ownStakeNum + allNoms.reduce((s, n) => s + parseFloat(n.amount || 0), 0)).toFixed(4);
-  console.log(`[scanNominators] Done: ${allNoms.filter(n=>n.active).length} active, ${allNoms.filter(n=>!n.active).length} waiting, total: ${grandTotal} ${watcher.token}`);
-  return { allNoms, activeNoms: allNoms.filter(n => n.active), pendingNoms: allNoms.filter(n => !n.active), grandTotal };
-}
 
 // ── Phragmén scheduler ────────────────────────────────────────────────────────
 
@@ -119,6 +59,7 @@ function schedulePhragmen(watcher, notifier, state, token) {
 
     if (!CONFIG.rankScheduleUTC.includes(hourUTC)) return;
     if (lastRunHour === hourUTC) return; // already ran this hour
+    if (rankLock.busy) return;           // /rank in progress — retry on the next tick
     lastRunHour = hourUTC;
 
     // At 6:00 UTC (9:00 UTC+3) — refresh cache
@@ -130,7 +71,8 @@ function schedulePhragmen(watcher, notifier, state, token) {
 
     console.log(`[Phragmen] Scheduled run at UTC ${hourUTC}:00`);
     try {
-      const result   = await runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, forceRefresh);
+      const result   = await rankLock.run(() =>
+        runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, forceRefresh));
       const messages = Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 5 });
 
       // Save to state for /rank command
@@ -142,12 +84,12 @@ function schedulePhragmen(watcher, notifier, state, token) {
       for (const msg of messages) await notifier.send(msg);
     } catch (e) {
       console.error('[Phragmen] Scheduled run error:', e.message);
-      await notifier.send(`🔴 <b>Phragmén analysis error</b>\n<code>${e.message}</code>`);
+      await notifier.send(`🔴 <b>Phragmén analysis error</b>\n<code>${escapeHtml(e.message)}</code>`);
     }
   };
 
   // Check every minute
-  setInterval(tick, 60_000);
+  setInterval(() => tick().catch(e => console.error('[Phragmen] Tick error:', e.message)), 60_000);
   console.log(`[Phragmen] Scheduler active. Runs at UTC: ${CONFIG.rankScheduleUTC.join(', ')}:00`);
   console.log(`[Phragmen] That is UTC+3: ${CONFIG.rankScheduleUTC.map(h => ((h + 3) % 24)).join(', ')}:00`);
 }
@@ -196,40 +138,46 @@ async function main() {
     nomCheckInterval:     CONFIG.nomCheckMs,
     keyCheckInterval:     CONFIG.keyCheckMs,
     pendingCheckInterval: CONFIG.pendingCheckInterval,
-    oversubLimit:         CONFIG.oversubLimit,
     offlineThreshold:     CONFIG.offlineThreshold,
     onlineThreshold:      CONFIG.onlineThreshold,
     minStakeChange:       CONFIG.minStakeChange,
     nodeRpcEndpoint:      CONFIG.nodeRpcEndpoint,
     nodeHealthInterval:   CONFIG.nodeHealthInterval,
+    nodeOfflineThreshold: CONFIG.nodeOfflineThreshold,
+    nodeOnlineThreshold:  CONFIG.nodeOnlineThreshold,
+    nodeSyncThreshold:    CONFIG.nodeSyncThreshold,
   });
 
   // ── /status ──────────────────────────────────────────────────────────────
   notifier.setStatusProvider(() => watcher.getStatus());
 
   // ── /rank — run fresh Phragmén or return cached ───────────────────────────
-  notifier.setRankProvider(async () => {
+  notifier.setRankProvider(async (onStart) => {
     const token = watcher.token || 'DOT';
     // Always run fresh on /rank command (child process keeps monitor heap clean)
-    const result = await runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, false);
+    const result = await rankLock.run(async () => {
+      await onStart();
+      return runPhragmenInChild(CONFIG.rpcEndpoint, CONFIG.validatorAddress, false);
+    });
     await state.set('last_rank_result', result);
     await state.set('last_rank_token', token);
     return Notifier.formatRank(result, CONFIG.validatorAddress, token, { topN: 10, links: true });
   });
 
   // ── /nominators ───────────────────────────────────────────────────────────
-  notifier.setNominatorsProvider(async () => {
-    const { activeNoms, pendingNoms } = await scanNominators(watcher, state);
+  notifier.setNominatorsProvider(async (onStart) => {
+    const { activeNoms, pendingNoms } = await watcher.scanPool(onStart);
     return Notifier.formatNominators(activeNoms, pendingNoms, watcher.token, CONFIG.validatorAddress);
   });
 
   // ── /update ───────────────────────────────────────────────────────────────
-  notifier.setUpdateProvider(async () => {
-    const { activeNoms, pendingNoms, grandTotal } = await scanNominators(watcher, state);
+  notifier.setUpdateProvider(async (onStart) => {
+    const { activeNoms, pendingNoms, grandTotal, failed } = await watcher.scanPool(onStart);
     return (
       `✅ <b>Database updated</b>\n` +
       `Active: <b>${activeNoms.length}</b>  Waiting: <b>${pendingNoms.length}</b>\n` +
-      `Total bonded: <b>${grandTotal} ${watcher.token}</b>`
+      `Total bonded: <b>${grandTotal} ${watcher.token}</b>` +
+      (failed > 0 ? `\n⚠️ ${failed} ledger queries failed — previous values kept` : '')
     );
   });
 
@@ -240,19 +188,28 @@ async function main() {
   });
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`\n[Main] ${signal} — shutting down…`);
-    await notifier.stopPolling();
-    await watcher.disconnect();
-    await state.close();
+    setTimeout(() => process.exit(0), 10_000).unref();   // don't hang on a stuck close
+    for (const [name, fn] of [['polling', () => notifier.stopPolling()], ['chain', () => watcher.disconnect()], ['state', () => state.close()]]) {
+      try { await fn(); } catch (e) { console.error(`[Main] Shutdown ${name} error:`, e.message); }
+    }
     process.exit(0);
   };
   process.on('SIGINT',  () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('uncaughtException', async (err) => {
     console.error('[Main] Unhandled exception:', err);
-    await notifier.send(`🔴 <b>Monitor critical error</b>\n<code>${err.message}</code>`).catch(() => {});
+    await notifier.send(`🔴 <b>Monitor critical error</b>\n<code>${escapeHtml(err.message)}</code>`).catch(() => {});
     process.exit(1);
+  });
+  // Stray rejections are logged, not fatal — a transient RPC error must not
+  // take the whole monitor down (and PM2 gives up after max_restarts).
+  process.on('unhandledRejection', (reason) => {
+    console.error('[Main] Unhandled rejection:', reason);
   });
 
   // ── Start ──────────────────────────────────────────────────────────────────
@@ -278,4 +235,7 @@ async function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error('[Main] Fatal:', err);
+  process.exit(1);
+});
