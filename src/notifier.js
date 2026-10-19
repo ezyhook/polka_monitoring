@@ -574,8 +574,14 @@ class Notifier {
     // Anchor block — inline for scheduled (topN=5), separate message for /rank (topN=10)
     if (r.myAnchors && r.myAnchors.length > 0) {
       const top      = r.myAnchors.slice(0, topN);
-      const excCount = r.exclusiveCount ?? top.filter(n => n.exclusive || n.targets === 1).length;
-      const excTotal = r.exclusiveTotal ?? top.filter(n => n.exclusive || n.targets === 1).reduce((s,n) => s + (n.budget||0), 0);
+      const excCount = r.exclusiveCount ?? 0;
+      const excTotal = r.exclusiveTotal ?? 0;
+      const fullCount = r.fullCount ?? 0;
+      const fullTotal = r.fullTotal ?? 0;
+      const mark = (n) => (n.exclusive ? ' 🔒' : n.full ? ' 💯' : '');
+      // "7/16" when some nominations point at non-validators
+      const targetsStr = (n) => (n.targets == null ? '?'
+        : n.nominated != null && n.nominated !== n.targets ? `${n.targets}/${n.nominated}` : `${n.targets}`);
 
       if (links) {
         // /rank: detailed second message with Subscan links
@@ -583,7 +589,9 @@ class Notifier {
           `🎯 <b>Anchor Nominator Analysis</b>\n` +
           `<code>${validatorAddr}</code>\n` +
           `━━━━━━━━━━━━━━━━━━━━━\n` +
-          `🔒 Exclusive (100% to you): <b>${excCount}</b> nominators — <b>${fmt(excTotal)}</b>\n` +
+          `🔒 Exclusive (you are their only validator): <b>${excCount}</b> — <b>${fmt(excTotal)}</b>\n` +
+          `💯 100% of stake to you this era (other targets too): <b>${fullCount}</b> — <b>${fmt(fullTotal)}</b>\n` +
+          (r.backerCount != null ? `Backers total: <b>${r.backerCount}</b>\n` : '') +
           `━━━━━━━━━━━━━━━━━━━━━\n` +
           `Top ${top.length} by stake given to you:\n`;
 
@@ -595,26 +603,24 @@ class Notifier {
           const nameStr   = url ? `<a href="${url}">${shortAddr}</a>` : `<code>${shortAddr}</code>`;
           const budgetStr = n.budget    != null ? n.budget.toLocaleString('en',    { maximumFractionDigits: 0 }) : '—';
           const effStr    = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 0 }) : '—';
-          const exclMark  = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
 
           anchor +=
-            `${i + 1}. ${nameStr}${exclMark}\n` +
-            `   budget: <b>${budgetStr} ${token}</b>  targets: ${n.targets ?? '?'}  to you: <b>${effStr} ${token}</b>\n`;
+            `${i + 1}. ${nameStr}${mark(n)}\n` +
+            `   budget: <b>${budgetStr} ${token}</b>  targets: ${targetsStr(n)}  to you: <b>${effStr} ${token}</b>\n`;
         }
+        anchor += `<i>targets: valid validators / all nominations</i>`;
 
         messages.push(anchor);
       } else {
         // Scheduled: compact top-5 inline in the first message (insert before footer)
-        const excTotalFmt = excTotal != null ? fmt(excTotal) : '—';
         let anchorBlock =
-          `${EMOJI.nominator} <b>Top anchors</b>  (excl: ${excCount} → ${excTotalFmt})\n`;
+          `${EMOJI.nominator} <b>Top anchors</b>  (🔒 ${excCount} → ${fmt(excTotal)}, 💯 ${fullCount} → ${fmt(fullTotal)})\n`;
         for (let i = 0; i < top.length; i++) {
           const n      = top[i];
           const addr   = n.addr || n.nomAddr || '';
           const short  = addr ? addr.slice(0, 8) + '…' : '?…';
-          const excl   = (n.exclusive || n.targets === 1) ? ' 🔒' : '';
           const effStr = n.effective != null ? n.effective.toLocaleString('en', { maximumFractionDigits: 1 }) : '—';
-          anchorBlock += `  ${i + 1}. <code>${short}</code>  eff: ${effStr} ${token}  [${n.targets ?? '?'}t]${excl}\n`;
+          anchorBlock += `  ${i + 1}. <code>${short}</code>  eff: ${effStr} ${token}  [${targetsStr(n)}t]${mark(n)}\n`;
         }
         // Rebuild msg1 with anchor inserted before footer
         messages[0] = header + eraLine + predLine + anchorBlock + footer;

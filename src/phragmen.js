@@ -246,7 +246,14 @@ async function eraBackers(api, era, validatorAddress) {
   return result;
 }
 
-/** Anchor list: backers sorted by the stake they give us, with budget and target count. */
+/**
+ * Anchor list: backers sorted by the stake they give us.
+ *   targets   — nominations that are current validators (others can't receive stake)
+ *   nominated — all nominations, incl. chilled / removed validators
+ *   exclusive — we are their only valid target: structurally 100% to us, every era
+ *   full      — gave us ≥99.9% of their stake in this election, though they
+ *               have other valid targets (the election's choice, can change)
+ */
 function anchorsFrom(backers) {
   const all = backers
     .sort((a, b) => b.weight - a.weight)
@@ -254,14 +261,21 @@ function anchorsFrom(backers) {
       addr:      b.addr,
       budget:    b.budget,
       targets:   b.targets,
+      nominated: b.nominated ?? b.targets,
       effective: b.weight,
       exclusive: b.targets === 1,
+      full:      b.targets > 1 && b.budget > 0 && b.weight >= b.budget * 0.999,
     }));
+  const sum = (list) => list.reduce((s, n) => s + n.effective, 0);
   const exclusive = all.filter(n => n.exclusive);
+  const full      = all.filter(n => n.full);
   return {
     myAnchors:      all.slice(0, 10),
+    backerCount:    all.length,
     exclusiveCount: exclusive.length,
-    exclusiveTotal: exclusive.reduce((s, n) => s + n.budget, 0),
+    exclusiveTotal: sum(exclusive),
+    fullCount:      full.length,
+    fullTotal:      sum(full),
   };
 }
 
@@ -298,7 +312,7 @@ function simulate(inputs, validatorAddress, desired, source, era) {
   };
   const backers = r.backers(validatorAddress)
     .filter(b => b.voter !== validatorAddress)
-    .map(b => ({ addr: b.voter, budget: b.budget, targets: b.targets, weight: idx >= 0 ? b.weight : b.budget }));
+    .map(b => ({ addr: b.voter, budget: b.budget, targets: b.targets, nominated: b.nominated, weight: idx >= 0 ? b.weight : b.budget }));
   return { projection, backers };
 }
 
@@ -336,7 +350,8 @@ async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) 
   const era          = activeEraOpt.isSome ? activeEraOpt.unwrap().index.toNumber() : plannedEra;
   const sessionIdx   = (await api.query.session.currentIndex()).toNumber();
   const maxSlots     = (await api.query.staking.validatorCount()).toNumber();
-  const candidates   = (await api.query.staking.validators.keys()).length;
+  const validatorSet = new Set((await api.query.staking.validators.keys()).map(k => k.args[0].toString()));
+  const candidates   = validatorSet.size;
 
   // Active era — real on-chain data
   const now = await eraStatus(api, era, validatorAddress);
@@ -358,8 +373,10 @@ async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) 
       const noms    = await api.query.staking.nominators.multi(addrs);
       const budgets = await batchGetLedgers(api, addrs);
       backers.forEach((b, i) => {
-        b.budget  = budgets.get(b.addr) || 0;
-        b.targets = noms[i].isSome ? noms[i].unwrap().targets.length : null;
+        const targets = noms[i].isSome ? noms[i].unwrap().targets.map(t => t.toString()) : [];
+        b.budget    = budgets.get(b.addr) || 0;
+        b.nominated = targets.length;
+        b.targets   = targets.filter(t => validatorSet.has(t)).length;   // only current validators count
       });
     }
   }

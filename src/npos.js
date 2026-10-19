@@ -35,7 +35,7 @@ function seqPhragmen(targets, voters, toElect, { balancingIterations = 10, toler
     }
     if (edges.length === 0) continue;
     const vi = vs.length;
-    vs.push({ id: v.id, budget: v.stake, load: 0, edges });
+    vs.push({ id: v.id, budget: v.stake, load: 0, edges, nominated: v.targets.length });
     edges.forEach((e, ei) => {
       cands[e.c].approval += v.stake;
       cands[e.c].edges.push([vi, ei]);
@@ -100,7 +100,8 @@ function seqPhragmen(targets, voters, toElect, { balancingIterations = 10, toler
       const i = cIndex.get(id);
       if (i === undefined) return [];
       return cands[i].edges
-        .map(([vi, ei]) => ({ voter: vs[vi].id, budget: vs[vi].budget, targets: vs[vi].edges.length, weight: vs[vi].edges[ei].weight }))
+        // targets = nominations that are current candidates; nominated = all nominations
+        .map(([vi, ei]) => ({ voter: vs[vi].id, budget: vs[vi].budget, targets: vs[vi].edges.length, nominated: vs[vi].nominated, weight: vs[vi].edges[ei].weight }))
         .filter(b => b.weight > 0 || !cands[i].elected);
     },
   };
