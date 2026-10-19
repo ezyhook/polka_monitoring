@@ -1,6 +1,8 @@
 'use strict';
 
-require('dotenv').config();
+// .env wins over the inherited environment: a process manager or parent
+// process (e.g. another bot) may carry its own TELEGRAM_BOT_TOKEN etc.
+require('dotenv').config({ override: true });
 
 const StateManager                    = require('./src/state');
 const Notifier                        = require('./src/notifier');

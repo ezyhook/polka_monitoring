@@ -52,7 +52,7 @@ pm2 startup
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in the required values:
+Copy `.env.example` to `.env` and fill in the required values. The bot always takes values from `.env`, even if the same variable is already set in the environment (e.g. inherited from a parent process):
 
 ```env
 VALIDATOR_ADDRESS=14PkBX3B...            # your validator stash address
