@@ -5,7 +5,7 @@ Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post
 ## Features
 
 - **Node health** — polls `system_health` on your validator's HTTP RPC every 60s; alerts on offline/syncing/online transitions (`NODE_*_THRESHOLD`); disabled automatically if `NODE_RPC_ENDPOINT` is empty
-- **Active/inactive** — tracks status in the active era via `erasStakersOverview`
+- **Active/inactive** — tracks status in the active era via `erasStakersOverview`; once the next era is elected (~1h after an era starts) sends "Elected / NOT elected for era N" with rank and buffer
 - **Nominator changes** — two-tier scan: active nominators every 5 min, waiting (all `staking.nominators`) every 4h; alerts when stake change exceeds `MIN_STAKE_CHANGE` DOT
 - **Payouts** — catches `staking.Rewarded` events (era taken from `PayoutStarted`, pages summed); history bootstrapped from chain (commission + own-stake share)
 - **Session keys** — monitors `session.nextKeys` on Relay Chain every 5 min

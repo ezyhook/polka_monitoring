@@ -292,6 +292,25 @@ class Notifier {
       `Era: <b>${era}</b>\n<code>${addr}</code>`);
   }
 
+  /** Result of the election for the next era (sent once per era). */
+  electionResult(addr, era, r, token) {
+    const n = (v) => Number(v).toLocaleString('en', { maximumFractionDigits: 0 });
+    if (!r.elected) {
+      return this.send(
+        `🚨 <b>NOT elected for era ${era}</b>\n` +
+        `Your validator will be WAITING from era ${era}.\n` +
+        `Last elected stake: <b>${n(r.last)} ${token}</b>\n` +
+        `<code>${addr}</code>`);
+    }
+    const warn = r.bufferPct == null ? '' : r.bufferPct < 5 ? ' ⚠️ DANGER ZONE' : r.bufferPct < 15 ? ' ⚡ CAUTION' : '';
+    return this.send(
+      `🗳 <b>Elected for era ${era}</b>${warn}\n` +
+      `Rank: <b>#${r.rank}/${r.count}</b>\n` +
+      `Stake: <b>${n(r.stake)} ${token}</b>\n` +
+      `Buffer: <b>+${n(r.buffer)} ${token}</b>` + (r.bufferPct != null ? ` (${r.bufferPct.toFixed(1)}% above last)` : '') + `\n` +
+      `<code>${addr}</code>`);
+  }
+
   /** Slash is critical — always sent, no cooldown. */
   validatorSlashed(addr, amount, token) {
     return this.send(

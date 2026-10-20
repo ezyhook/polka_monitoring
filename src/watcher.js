@@ -159,6 +159,7 @@ class ChainWatcher {
     this._blockBusy = true;
     try {
       await this._safe('ActiveSet',  () => this._checkActiveSet(blockNum));
+      await this._safe('Election',   () => this._checkElection());
       await this._safe('Nominators', () => this._checkNominators());
       await this._safe('Keys',       () => this._checkSessionKeys());
     } finally {
@@ -248,6 +249,57 @@ class ChainWatcher {
       await this.state.set('last_era', era);
       if (isActive && !prevActive)  await this.notifier.validatorActive(this.addr, era);
       if (!isActive && prevActive)  await this.notifier.validatorInactive(this.addr, era);
+    }
+  }
+
+  // ── Next-era election result ─────────────────────────────────────────────────
+  //
+  // The election for era N+1 runs right after era N starts; once its
+  // exposures are exported (~1h) we know whether we're in the next set.
+  // One notification per planned era, elected or not.
+
+  async _checkElection() {
+    const now = Date.now();
+    if (now - (this._electionCheckTs || 0) < 60_000) return;
+    this._electionCheckTs = now;
+
+    const plannedOpt = await this.api.query.staking.currentEra();
+    if (plannedOpt.isNone) return;
+    const planned = plannedOpt.unwrap().toNumber();
+    const active  = await this._activeEra();
+    if (planned <= active) return;                                         // election not started
+    if ((await this.state.get('election_notified_era', 0)) >= planned) return;
+
+    const slots   = (await this.api.query.staking.validatorCount()).toNumber();
+    const entries = await this.api.query.staking.erasStakersOverview.entries(planned);
+    const phase   = this.api.query.multiBlockElection?.currentPhase
+      ? await this.api.query.multiBlockElection.currentPhase() : null;
+    const exported = entries.length >= slots || (entries.length > 0 && phase && phase.isOff);
+    if (!exported) return;                                                 // still exporting
+
+    const sorted = entries
+      .map(([key, val]) => ({ addr: key.args[1].toString(), total: BigInt(val.unwrap().total.toString()) }))
+      .sort((a, b) => (b.total > a.total ? 1 : b.total < a.total ? -1 : 0));
+    const idx  = sorted.findIndex(v => v.addr === this.addr);
+    const last = sorted[sorted.length - 1].total;
+
+    await this.state.set('election_notified_era', planned);
+    if (idx >= 0) {
+      const mine   = sorted[idx].total;
+      const buffer = mine - last;
+      console.log(`[Election] Era ${planned}: elected #${idx + 1}/${sorted.length}`);
+      await this.notifier.electionResult(this.addr, planned, {
+        elected: true, rank: idx + 1, count: sorted.length,
+        stake:   toToken(mine.toString(), this.decimals),
+        buffer:  toToken(buffer.toString(), this.decimals),
+        bufferPct: last > 0n ? Number(buffer * 10_000n / last) / 100 : null,
+      }, this.token);
+    } else {
+      console.warn(`[Election] Era ${planned}: NOT elected`);
+      await this.notifier.electionResult(this.addr, planned, {
+        elected: false, count: sorted.length,
+        last: toToken(last.toString(), this.decimals),
+      }, this.token);
     }
   }
 
