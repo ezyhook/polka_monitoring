@@ -10,6 +10,7 @@ Self-hosted Telegram bot for monitoring a Polkadot validator. Built for the post
 - **Payouts** — catches `staking.Rewarded` events (era taken from `PayoutStarted`, pages summed); history bootstrapped from chain (commission + own-stake share)
 - **Session keys** — monitors `session.nextKeys` on Relay Chain every 5 min
 - **Slash / Chill** — instant alerts on `staking.Slashed` and `staking.Chilled` events
+- **Disabled in session** — Relay Chain `session.disabledValidators` + `ValidatorDisabled`/`ValidatorReenabled` events: alert when the validator is disabled mid-era after an offence (and when re-enabled); shown in `/status`
 - **RPC connectivity** — alerts if the monitor's Asset Hub RPC stops delivering blocks
 - **Slot position** — next era from the on-chain election result (or Seq-Phragmén + balancing on the official snapshot while the election runs), plus a forecast of the following election; scheduled and on demand via `/rank`
 

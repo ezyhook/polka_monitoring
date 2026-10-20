@@ -292,6 +292,22 @@ class Notifier {
       `Era: <b>${era}</b>\n<code>${addr}</code>`);
   }
 
+  /** Disabled by the relay chain after an offence — no backing/points until era end. */
+  validatorDisabled(addr, session, severity) {
+    return this.send(
+      `${EMOJI.offline} <b>Validator DISABLED</b> in session <b>${session}</b>\n` +
+      `Relay chain disabled it after an offence: no backing, approvals or era points until the era ends.\n` +
+      (severity != null ? `Offence severity: <b>${severity.toFixed(2)}%</b>\n` : '') +
+      `Check node logs (disputes, equivocation, double-signing) and the Offences on Subscan.\n` +
+      `<code>${addr}</code>`);
+  }
+
+  validatorReenabled(addr, session, status) {
+    return this.send(
+      `${EMOJI.ok} <b>Validator no longer disabled</b> (session ${session}` +
+      (status === 'out' ? ', not in the set this session' : '') + `)\n<code>${addr}</code>`);
+  }
+
   /** Result of the election for the next era (sent once per era). */
   electionResult(addr, era, r, token) {
     const n = (v) => Number(v).toLocaleString('en', { maximumFractionDigits: 0 });
@@ -398,7 +414,8 @@ class Notifier {
     }
     const rpcStr = s.online ? `${EMOJI.online} receiving blocks` : `${EMOJI.offline} no new blocks`;
 
-    const activeStr = s.active ? `${EMOJI.active} active`  : `${EMOJI.inactive} waiting`;
+    const activeStr = (s.active ? `${EMOJI.active} active`  : `${EMOJI.inactive} waiting`) +
+      (s.rcSession && s.rcSession.status === 'disabled' ? `  ${EMOJI.offline} <b>DISABLED in session ${s.rcSession.session}</b>` : '');
     const keysStr   = s.sessionKeys ? trimKey(s.sessionKeys) : (s.sessionKeysNote || 'not set');
     const pagesStr  = s.exposurePages > 1 ? ` (${s.exposurePages} exposure pages)` : '';
 

@@ -105,6 +105,7 @@ class ChainWatcher {
     const rcReady = ApiPromise.create({ provider: rcProvider }).then((api) => {
       this.rcApi = api;
       console.log(`[Chain] Relay Chain ready: ${this.rcRpc}`);
+      this._subscribeRcEvents().catch(e => console.error('[RC] Event subscription failed:', e.message));
       return api;
     });
     rcReady.catch((e) => console.warn(`[Chain] Relay Chain init failed (${e.message}) — session keys unavailable`));
@@ -160,6 +161,7 @@ class ChainWatcher {
     try {
       await this._safe('ActiveSet',  () => this._checkActiveSet(blockNum));
       await this._safe('Election',   () => this._checkElection());
+      await this._safe('RcSession',  () => this._checkRcSession());
       await this._safe('Nominators', () => this._checkNominators());
       await this._safe('Keys',       () => this._checkSessionKeys());
     } finally {
@@ -249,6 +251,64 @@ class ChainWatcher {
       await this.state.set('last_era', era);
       if (isActive && !prevActive)  await this.notifier.validatorActive(this.addr, era);
       if (!isActive && prevActive)  await this.notifier.validatorInactive(this.addr, era);
+    }
+  }
+
+  // ── Relay Chain session: disabling ───────────────────────────────────────────
+  //
+  // Mid-era the relay chain can disable a validator after an offence (lost
+  // dispute, equivocation…): it stays in the set but stops backing/approving
+  // and earns no points until the era ends. Lives in session.disabledValidators
+  // on the Relay Chain, not on Asset Hub. Events give instant alerts; a
+  // once-a-minute poll covers missed events and restarts.
+
+  async _subscribeRcEvents() {
+    const unsub = await this.rcApi.query.system.events((events) => {
+      const relevant = events.some(({ event: e }) =>
+        e.section === 'session' &&
+        ((e.method === 'ValidatorDisabled' || e.method === 'ValidatorReenabled') && e.data[0].toString() === this.addr
+          || e.method === 'NewSession'));
+      if (relevant) this._checkRcSession(true).catch(err => console.error('[RcSession] Error:', err.message));
+    });
+    this._unsubs.push(unsub);
+    console.log('[RC] Subscribed to session events');
+  }
+
+  /** Our status in the current relay session: 'active' | 'disabled' | 'out'. */
+  async _rcSessionStatus() {
+    const q = this.rcApi.query.session;
+    const [index, validators, disabled] = await Promise.all([q.currentIndex(), q.validators(), q.disabledValidators()]);
+    const idx = validators.findIndex(v => v.toString() === this.addr);
+    // Vec<(u32, OffenceSeverity)> on current runtimes, Vec<u32> on older ones
+    const entry = idx < 0 ? undefined : disabled.toJSON().find(d => (Array.isArray(d) ? d[0] : d) === idx);
+    const severity = Array.isArray(entry) ? Number(entry[1]) / 1e7 : null;   // Perbill → %
+    return {
+      session: index.toNumber(),
+      status:  idx < 0 ? 'out' : entry !== undefined ? 'disabled' : 'active',
+      severity,
+    };
+  }
+
+  async _checkRcSession(force = false) {
+    const now = Date.now();
+    if (!force && now - (this._rcSessionCheckTs || 0) < 60_000) return;
+    this._rcSessionCheckTs = now;
+    if (!this._rcAvailable()) return;
+
+    const cur  = await this._rcSessionStatus();
+    const prev = await this.state.get('rc_session_status', null);
+    this._rcSession = cur;
+    if (prev && prev.status === cur.status) return;
+    await this.state.set('rc_session_status', cur);
+
+    // 'out' ↔ 'active' happens at era boundaries and is covered by the
+    // active/waiting and election alerts — only disabling is alerted here.
+    if (cur.status === 'disabled') {
+      console.warn(`[RcSession] DISABLED in session ${cur.session}`);
+      await this.notifier.validatorDisabled(this.addr, cur.session, cur.severity);
+    } else if (prev && prev.status === 'disabled') {
+      console.log(`[RcSession] Re-enabled in session ${cur.session} (${cur.status})`);
+      await this.notifier.validatorReenabled(this.addr, cur.session, cur.status);
     }
   }
 
@@ -761,6 +821,8 @@ class ChainWatcher {
         sessionKeys = await this._refreshSessionKeys();
         if (!sessionKeys) sessionKeysNote = 'not set';
       } catch (e) { console.error('[Status] Session keys error:', e.message); }
+      try { this._rcSession = await this._rcSessionStatus(); }   // fresh for /status
+      catch (e) { console.error('[Status] Session status error:', e.message); }
     }
 
     const payoutHistory = await this.state.get('payout_history', []) || [];
@@ -783,6 +845,7 @@ class ChainWatcher {
       exposurePages: exposure ? exposure.pageCount : 0,
       nodeRpcConfigured: !!this.nodeRpc,
       nodeState: this._nodeState,
+      rcSession: this._rcSession || null,
       nodePeers: this._nodeLastPeers,
     });
   }
