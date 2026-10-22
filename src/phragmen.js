@@ -357,7 +357,11 @@ async function analyzeSlotPosition(api, validatorAddress, forceRefresh = false) 
   // Next era: exact if already elected and exported
   if (plannedEra > era) {
     const st = await eraStatus(api, plannedEra, validatorAddress);
-    if (st.count >= maxSlots) {
+    // Exposures are complete only once the election phase is Off — during
+    // Export all winners exist but their totals are still partial.
+    const phase = api.query.multiBlockElection?.currentPhase ? await api.query.multiBlockElection.currentPhase() : null;
+    const final = phase ? (phase.isOff && st.count > 0) : st.count >= maxSlots;
+    if (final) {
       console.log(`[Phragmen] Era ${plannedEra} already elected (${st.count} validators) — on-chain result`);
       next = {
         source: 'chain', era: plannedEra,

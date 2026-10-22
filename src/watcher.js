@@ -334,7 +334,10 @@ class ChainWatcher {
     const entries = await this.api.query.staking.erasStakersOverview.entries(planned);
     const phase   = this.api.query.multiBlockElection?.currentPhase
       ? await this.api.query.multiBlockElection.currentPhase() : null;
-    const exported = entries.length >= slots || (entries.length > 0 && phase && phase.isOff);
+    // During the Export phase all winners appear on the first page but their
+    // totals grow page by page (era 2332: "last" went 302k → 1.21M → 1.29M over
+    // ~30 blocks). Only phase Off means the result is final.
+    const exported = phase ? (phase.isOff && entries.length > 0) : entries.length >= slots;
     if (!exported) return;                                                 // still exporting
 
     const sorted = entries
